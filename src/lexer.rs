@@ -10,7 +10,7 @@ impl<'a> Lexer<'a> {
         Self {
             src,
             index: 0,
-            at: SrcLoc::new("<<deadbeef>>", 1, 1),
+            at: SrcLoc::new("<dummy file; this should never appear; lexer bug>", 1, 1),
         }
     }
 
@@ -23,6 +23,11 @@ impl<'a> Lexer<'a> {
             };
             tokens.push(token);
         }
+
+        tokens.push(Token {
+            at: SrcLoc::new("<EOF>", 1, 1),
+            kind: TokenKind::Eof,
+        });
 
         tokens
     }
