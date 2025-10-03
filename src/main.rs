@@ -1,13 +1,27 @@
+use ecc::lexer::Lexer;
 use std::process::Command;
 
 fn main() {
     const SRC_FILE: &str = "main.c";
     let src = invoke_preprocessor(SRC_FILE).unwrap();
-    println!("{src}");
+    println!("--------------------------------------------------");
+    print!("{src}");
+    println!("--------------------------------------------------\n\n");
+
+    let tokens = Lexer::new(&src).lex();
+    for token in tokens {
+        println!(
+            "{} {}:{} {:?}",
+            token.at.file, token.at.line, token.at.column, token.kind
+        );
+    }
 }
 
 fn invoke_preprocessor(file: &str) -> Result<String, ()> {
-    let out = Command::new("cpp")
+    let out = Command::new("gcc")
+        .arg("-E")
+        .arg("-xc")
+        .arg("-std=c23")
         .arg("-nostdinc")
         .arg("-undef")
         .arg(file)
