@@ -8,11 +8,12 @@ fn main() {
     print!("{src}");
     println!("--------------------------------------------------\n\n");
 
-    let tokens = Lexer::new(&src).lex();
+    let (tokens, files) = Lexer::new(&src).lex();
     for token in tokens {
+        let file = &files[token.at.file];
         println!(
-            "{} {}:{} {:?}",
-            token.at.file, token.at.line, token.at.column, token.kind
+            "{} {}:{}\t{:?}",
+            file, token.at.line, token.at.column, token.kind
         );
     }
 }
