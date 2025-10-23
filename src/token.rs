@@ -154,7 +154,6 @@ pub enum StringEncoding {
     Wide,
 }
 
-
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct At {
     pub column: u32,

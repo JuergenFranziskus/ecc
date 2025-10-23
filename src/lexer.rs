@@ -1,4 +1,6 @@
-use crate::token::{At, Files, IntegerFormat, IntegerSuffix, IntegerToken, StringEncoding, Token, TokenKind};
+use crate::token::{
+    At, Files, IntegerFormat, IntegerSuffix, IntegerToken, StringEncoding, Token, TokenKind,
+};
 
 pub struct Lexer<'a> {
     src: &'a str,
@@ -83,23 +85,20 @@ impl<'a> Lexer<'a> {
 
         if self.is_string_literal() {
             self.lex_string_literal()
-        }
-        else if self.matches("0x") || self.matches("0X") && self.peek(2).is_ascii_hexdigit() {
+        } else if self.matches("0x") || self.matches("0X") && self.peek(2).is_ascii_hexdigit() {
             self.lex_hexadecimal_literal()
-        }
-        else if self.matches("0b") || self.matches("0B") && self.peek(2) == '0' || self.peek(2) == '1' {
+        } else if self.matches("0b")
+            || self.matches("0B") && self.peek(2) == '0'
+            || self.peek(2) == '1'
+        {
             self.lex_binary_literal()
-        }
-        else if self.matches("0") {
+        } else if self.matches("0") {
             self.lex_octal_literal()
-        }
-        else if self.cur().is_ascii_digit() {
+        } else if self.cur().is_ascii_digit() {
             self.lex_decimal_literal()
-        }
-        else if self.cur().is_ascii_alphabetic() {
+        } else if self.cur().is_ascii_alphabetic() {
             self.lex_identifier()
-        }
-        else {   
+        } else {
             self.next();
             Token {
                 at,
@@ -109,27 +108,28 @@ impl<'a> Lexer<'a> {
     }
     fn lex_string_literal(&mut self) -> Token<'a> {
         let encoding = self.lex_string_encoding();
-        
+
         let at = self.at;
         self.next();
         let start = self.index;
         loop {
             if self.matches("\\\"") {
                 self.advance(2);
-            }
-            else if self.matches("\"") {
+            } else if self.matches("\"") {
                 break;
-            }
-            else {
+            } else {
                 self.next();
             }
         }
         let end = self.index;
         self.next();
-        
+
         let src = &self.src[start..end];
 
-        Token { at, kind: TokenKind::String(src, encoding) }
+        Token {
+            at,
+            kind: TokenKind::String(src, encoding),
+        }
     }
     fn lex_hexadecimal_literal(&mut self) -> Token<'a> {
         let at = self.at;
@@ -138,17 +138,20 @@ impl<'a> Lexer<'a> {
         while self.cur().is_ascii_hexdigit() || self.cur() == '\'' {
             self.next();
         }
-        
+
         let end = self.index;
         let src = &self.src[start..end];
 
         let suffix = self.lex_integer_suffix();
 
-        Token { at, kind: TokenKind::Integer(IntegerToken {
-            source: src,
-            format: IntegerFormat::Hexadecimal,
-            suffix,
-        })}
+        Token {
+            at,
+            kind: TokenKind::Integer(IntegerToken {
+                source: src,
+                format: IntegerFormat::Hexadecimal,
+                suffix,
+            }),
+        }
     }
     fn lex_binary_literal(&mut self) -> Token<'a> {
         let at = self.at;
@@ -157,17 +160,20 @@ impl<'a> Lexer<'a> {
         while is_binary_digit(self.cur()) || self.cur() == '\'' {
             self.next();
         }
-        
+
         let end = self.index;
         let src = &self.src[start..end];
 
         let suffix = self.lex_integer_suffix();
 
-        Token { at, kind: TokenKind::Integer(IntegerToken {
-            source: src,
-            format: IntegerFormat::Binary,
-            suffix,
-        })}
+        Token {
+            at,
+            kind: TokenKind::Integer(IntegerToken {
+                source: src,
+                format: IntegerFormat::Binary,
+                suffix,
+            }),
+        }
     }
     fn lex_octal_literal(&mut self) -> Token<'a> {
         let at = self.at;
@@ -175,17 +181,20 @@ impl<'a> Lexer<'a> {
         while is_octal_digit(self.cur()) || self.cur() == '\'' {
             self.next();
         }
-        
+
         let end = self.index;
         let src = &self.src[start..end];
 
         let suffix = self.lex_integer_suffix();
 
-        Token { at, kind: TokenKind::Integer(IntegerToken {
-            source: src,
-            format: IntegerFormat::Octal,
-            suffix,
-        })}
+        Token {
+            at,
+            kind: TokenKind::Integer(IntegerToken {
+                source: src,
+                format: IntegerFormat::Octal,
+                suffix,
+            }),
+        }
     }
     fn lex_decimal_literal(&mut self) -> Token<'a> {
         let at = self.at;
@@ -193,17 +202,20 @@ impl<'a> Lexer<'a> {
         while self.cur().is_ascii_digit() || self.cur() == '\'' {
             self.next();
         }
-        
+
         let end = self.index;
         let src = &self.src[start..end];
 
         let suffix = self.lex_integer_suffix();
 
-        Token { at, kind: TokenKind::Integer(IntegerToken {
-            source: src,
-            format: IntegerFormat::Decimal,
-            suffix,
-        })}
+        Token {
+            at,
+            kind: TokenKind::Integer(IntegerToken {
+                source: src,
+                format: IntegerFormat::Decimal,
+                suffix,
+            }),
+        }
     }
     fn lex_identifier(&mut self) -> Token<'a> {
         let at = self.at;
@@ -215,51 +227,68 @@ impl<'a> Lexer<'a> {
         let end = self.index;
         let src = &self.src[start..end];
 
-        Token { at, kind: TokenKind::Identifier(src), }
+        Token {
+            at,
+            kind: TokenKind::Identifier(src),
+        }
     }
 
     fn lex_integer_suffix(&mut self) -> Option<IntegerSuffix> {
         if self.matches("u") || self.matches("U") {
             self.next();
             Some(IntegerSuffix::Unsigned)
-        }
-        else if self.matches("ul") || self.matches("UL") || self.matches("uL") || self.matches("Ul") {
+        } else if self.matches("ul")
+            || self.matches("UL")
+            || self.matches("uL")
+            || self.matches("Ul")
+        {
             self.advance(2);
             Some(IntegerSuffix::LongUnsigned)
-        }
-        else if self.matches("ull") || self.matches("ULL") || self.matches("uLL") || self.matches("Ull") {
+        } else if self.matches("ull")
+            || self.matches("ULL")
+            || self.matches("uLL")
+            || self.matches("Ull")
+        {
             self.advance(3);
             Some(IntegerSuffix::LongLongUnsigned)
-        }
-        else if self.matches("uwb") || self.matches("UWB") || self.matches("uWB") || self.matches("Uwb") {
+        } else if self.matches("uwb")
+            || self.matches("UWB")
+            || self.matches("uWB")
+            || self.matches("Uwb")
+        {
             self.advance(3);
             Some(IntegerSuffix::BitPreciseUnsigned)
-        }
-        else if self.matches("l") || self.matches("L") {
+        } else if self.matches("l") || self.matches("L") {
             self.next();
             Some(IntegerSuffix::Long)
-        }
-        else if self.matches("lu") || self.matches("LU") || self.matches("lU") || self.matches("Lu") {
+        } else if self.matches("lu")
+            || self.matches("LU")
+            || self.matches("lU")
+            || self.matches("Lu")
+        {
             self.advance(2);
             Some(IntegerSuffix::LongUnsigned)
-        }
-        else if self.matches("ll") || self.matches("LL") {
+        } else if self.matches("ll") || self.matches("LL") {
             self.advance(2);
             Some(IntegerSuffix::LongLong)
-        }
-        else if self.matches("llu") || self.matches("LLU") || self.matches("llU") || self.matches("LLu") {
+        } else if self.matches("llu")
+            || self.matches("LLU")
+            || self.matches("llU")
+            || self.matches("LLu")
+        {
             self.advance(3);
             Some(IntegerSuffix::LongLongUnsigned)
-        }
-        else if self.matches("wb") || self.matches("WB") {
+        } else if self.matches("wb") || self.matches("WB") {
             self.advance(2);
             Some(IntegerSuffix::BitPrecise)
-        }
-        else if self.matches("wbu") || self.matches("WBU") || self.matches("wbU") || self.matches("WBu") {
+        } else if self.matches("wbu")
+            || self.matches("WBU")
+            || self.matches("wbU")
+            || self.matches("WBu")
+        {
             self.advance(3);
             Some(IntegerSuffix::BitPreciseUnsigned)
-        }
-        else {
+        } else {
             None
         }
     }
@@ -273,17 +302,13 @@ impl<'a> Lexer<'a> {
     fn lex_string_encoding(&mut self) -> StringEncoding {
         if self.matches("u8") {
             StringEncoding::UTF8
-        }
-        else if self.matches("u") {
+        } else if self.matches("u") {
             StringEncoding::UTF16
-        }
-        else if self.matches("U") {
+        } else if self.matches("U") {
             StringEncoding::UTF32
-        }
-        else if self.matches("L") {
+        } else if self.matches("L") {
             StringEncoding::Wide
-        }
-        else {
+        } else {
             StringEncoding::None
         }
     }
@@ -318,7 +343,6 @@ impl<'a> Lexer<'a> {
     }
 }
 
-
 fn is_octal_digit(c: char) -> bool {
     matches!(c, '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7')
 }
@@ -330,7 +354,6 @@ static TOKEN_MAP: &[(&'static str, TokenKind)] = &[
     ("...", TokenKind::Ellipses),
     ("<<=", TokenKind::DoubleLessEqual),
     (">>=", TokenKind::DoubleGreaterEqual),
-    
     ("->", TokenKind::ArrowLeft),
     ("++", TokenKind::DoublePlus),
     ("--", TokenKind::DoubleMinus),
@@ -351,7 +374,6 @@ static TOKEN_MAP: &[(&'static str, TokenKind)] = &[
     ("&=", TokenKind::Ampersand),
     ("^=", TokenKind::CaretEqual),
     ("|=", TokenKind::BarEqual),
-
     ("[", TokenKind::OpenSquare),
     ("]", TokenKind::CloseSquare),
     ("(", TokenKind::OpenParen),
@@ -376,8 +398,6 @@ static TOKEN_MAP: &[(&'static str, TokenKind)] = &[
     (";", TokenKind::Semicolon),
     ("=", TokenKind::Equal),
     (",", TokenKind::Comma),
-
-
     ("alignas", TokenKind::Alignas),
     ("alignof", TokenKind::Alignof),
     ("auto", TokenKind::Auto),
