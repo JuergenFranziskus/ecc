@@ -1,4 +1,4 @@
-use ecc::lexer::Lexer;
+use ecc::{lexer::Lexer, parser::Parser};
 use std::process::Command;
 
 fn main() {
@@ -9,13 +9,16 @@ fn main() {
     println!("--------------------------------------------------\n\n");
 
     let (tokens, files) = Lexer::new(&src).lex();
-    for token in tokens {
+    for &token in &tokens {
         let file = &files[token.at.file];
         println!(
             "{} {}:{}\t{:?}",
             file, token.at.line, token.at.column, token.kind
         );
     }
+
+    let ast = Parser::new(&tokens).parse().unwrap();
+    println!("{ast:#?}");
 }
 
 fn invoke_preprocessor(file: &str) -> Result<String, ()> {

@@ -4,21 +4,17 @@ use crate::token::{At, IntegerToken, StringEncoding, Token};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Node<T>(pub Rc<(At, T)>);
+impl<T> Node<T> {
+    pub fn new(at: At, value: T) -> Self {
+        Self(Rc::new((at, value)))
+    }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum List<T> {
-    Leaf(Node<T>),
-    Rec(Node<List<T>>, Node<T>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CommaList<T> {
-    Leaf(Node<T>),
-    Rec {
-        left: Node<List<T>>,
-        comma: At,
-        right: Node<T>,
-    },
+    pub fn at(&self) -> At {
+        self.0.0
+    }
+    pub fn value(&self) -> &T {
+        &self.0.1
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,7 +30,7 @@ pub enum PrimaryExpression<'a> {
         inner: Node<Expression<'a>>,
         close_parenthesis: At,
     },
-    Generic(GenericSelection<'a>),
+    Generic(Node<GenericSelection<'a>>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,9 +40,18 @@ pub struct GenericSelection<'a> {
     pub controlling_expression: Node<AssignmentExpression<'a>>,
     pub comma: At,
     pub association_list: Node<GenericAssocList<'a>>,
+    pub close_parenthesis: At,
 }
 
-pub type GenericAssocList<'a> = List<GenericAssociation<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GenericAssocList<'a> {
+    Leaf(Node<GenericAssociation<'a>>),
+    Rec {
+        left: Node<GenericAssocList<'a>>,
+        comma: At,
+        right: Node<GenericAssociation<'a>>,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GenericAssociation<'a> {
@@ -98,7 +103,15 @@ pub enum PostfixExpression<'a> {
     CompoundLiteral(Node<CompoundLiteral<'a>>),
 }
 
-pub type ArgumentExpressionList<'a> = CommaList<AssignmentExpression<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArgumentExpressionList<'a> {
+    Leaf(Node<AssignmentExpression<'a>>),
+    Rec {
+        left: Node<ArgumentExpressionList<'a>>,
+        comma: At,
+        right: Node<AssignmentExpression<'a>>,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompoundLiteral<'a> {
@@ -109,7 +122,11 @@ pub struct CompoundLiteral<'a> {
     pub initializer: Node<BracedInitializer<'a>>,
 }
 
-pub type StorageClassSpecifiers = List<StorageClassSpecifier>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StorageClassSpecifiers {
+    Leaf(Node<StorageClassSpecifier>),
+    Rec(Node<StorageClassSpecifiers>, Node<StorageClassSpecifier>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnaryExpression<'a> {
@@ -307,7 +324,7 @@ pub enum ConditionalExpression<'a> {
     LogicalOr(Node<LogicalOrExpression<'a>>),
     Conditional {
         condition: Node<LogicalOrExpression<'a>>,
-        question_mark: At,
+        question: At,
         then_value: Node<Expression<'a>>,
         colon: At,
         else_value: Node<ConditionalExpression<'a>>,
@@ -388,7 +405,15 @@ pub enum DeclarationSpecifier<'a> {
     FunctionSpecifier(Node<FunctionSpecifier>),
 }
 
-pub type InitDeclaratorList<'a> = CommaList<InitDeclarator<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InitDeclaratorList<'a> {
+    Leaf(Node<InitDeclarator<'a>>),
+    Rec {
+        left: Node<InitDeclaratorList<'a>>,
+        comma: At,
+        right: Node<InitDeclarator<'a>>,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InitDeclarator<'a> {
@@ -426,7 +451,7 @@ pub enum TypeSpecifier<'a> {
     Long,
     Float,
     Double,
-    Singed,
+    Signed,
     Unsigned,
     BitInt {
         bitint_keyword: At,
@@ -469,7 +494,11 @@ pub enum StructOrUnion {
     Union,
 }
 
-pub type MemberDeclarationList<'a> = List<MemberDeclaration<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberDeclarationList<'a> {
+    Leaf(Node<MemberDeclaration<'a>>),
+    Rec(Node<MemberDeclarationList<'a>>, Node<MemberDeclaration<'a>>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemberDeclaration<'a> {
@@ -501,7 +530,15 @@ pub enum TypeSpecifierQualifier<'a> {
     AlignmentSpecifier(Node<AlignmentSpecifier<'a>>),
 }
 
-pub type MemberDeclaratorList<'a> = CommaList<MemberDeclarator<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberDeclaratorList<'a> {
+    Leaf(Node<MemberDeclarator<'a>>),
+    Rec {
+        left: Node<MemberDeclaratorList<'a>>,
+        comma: At,
+        right: Node<MemberDeclarator<'a>>,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MemberDeclarator<'a> {
@@ -517,8 +554,8 @@ pub enum MemberDeclarator<'a> {
 pub enum EnumSpecifier<'a> {
     WithList {
         enum_keyword: At,
-        attributes: Node<AttributeSpecifierSequence<'a>>,
-        tag: &'a str,
+        attributes: Option<Node<AttributeSpecifierSequence<'a>>>,
+        tag: Option<&'a str>,
         enum_type: Option<Node<EnumTypeSpecifier<'a>>>,
         open_brace: At,
         enumerators: Node<EnumeratorList<'a>>,
@@ -532,7 +569,15 @@ pub enum EnumSpecifier<'a> {
     },
 }
 
-pub type EnumeratorList<'a> = CommaList<Enumerator<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnumeratorList<'a> {
+    Leaf(Node<Enumerator<'a>>),
+    Rec {
+        left: Node<EnumeratorList<'a>>,
+        comma: At,
+        right: Node<Enumerator<'a>>,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Enumerator<'a> {
@@ -672,9 +717,9 @@ pub enum ArrayDeclarator<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionDeclarator<'a> {
     pub left: Node<DirectDeclarator<'a>>,
-    pub open_paren: At,
+    pub open_parenthesis: At,
     pub parameters: Option<Node<ParameterTypeList<'a>>>,
-    pub close_paren: At,
+    pub close_parenthesis: At,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -692,7 +737,11 @@ pub enum Pointer<'a> {
     },
 }
 
-pub type TypeQualifierList = List<TypeQualifier>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TypeQualifierList {
+    Leaf(Node<TypeQualifier>),
+    Rec(Node<TypeQualifierList>, Node<TypeQualifier>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParameterTypeList<'a> {
@@ -707,7 +756,15 @@ pub enum ParameterTypeList<'a> {
     },
 }
 
-pub type ParameterList<'a> = CommaList<ParameterDeclaration<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParameterList<'a> {
+    Leaf(Node<ParameterDeclaration<'a>>),
+    Rec {
+        left: Node<ParameterList<'a>>,
+        comma: At,
+        right: Node<ParameterDeclaration<'a>>,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParameterDeclaration<'a> {
@@ -758,14 +815,14 @@ pub enum DirectAbstractDeclarator<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ArrayAbstractDeclarator<'a> {
     NoStatic {
-        left: Option<Node<DirectDeclarator<'a>>>,
+        left: Option<Node<DirectAbstractDeclarator<'a>>>,
         open_bracket: At,
         qualifiers: Option<Node<TypeQualifierList>>,
         length: Option<Node<AssignmentExpression<'a>>>,
         close_bracket: At,
     },
     StaticFirst {
-        left: Option<Node<DirectDeclarator<'a>>>,
+        left: Option<Node<DirectAbstractDeclarator<'a>>>,
         open_bracket: At,
         static_keyword: At,
         qualifiers: Option<Node<TypeQualifierList>>,
@@ -773,7 +830,7 @@ pub enum ArrayAbstractDeclarator<'a> {
         close_bracket: At,
     },
     StaticMid {
-        left: Option<Node<DirectDeclarator<'a>>>,
+        left: Option<Node<DirectAbstractDeclarator<'a>>>,
         open_bracket: At,
         qualifiers: Node<TypeQualifierList>,
         static_keyword: At,
@@ -781,7 +838,7 @@ pub enum ArrayAbstractDeclarator<'a> {
         close_bracket: At,
     },
     Variable {
-        left: Option<Node<DirectDeclarator<'a>>>,
+        left: Option<Node<DirectAbstractDeclarator<'a>>>,
         open_bracket: At,
         asterisk: At,
         close_bracket: At,
@@ -791,9 +848,9 @@ pub enum ArrayAbstractDeclarator<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionAbstractDeclarator<'a> {
     pub left: Option<Node<DirectAbstractDeclarator<'a>>>,
-    pub open_paren: At,
+    pub open_parenthesis: At,
     pub parameters: Option<Node<ParameterTypeList<'a>>>,
-    pub close_paren: At,
+    pub close_parenthesis: At,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -817,8 +874,15 @@ pub enum Initializer<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InitializerListEntry<'a>(pub Option<Node<Designation<'a>>>, pub Node<Initializer<'a>>);
-pub type InitializerList<'a> = CommaList<InitializerListEntry<'a>>;
+pub enum InitializerList<'a> {
+    Leaf(Option<Node<Designation<'a>>>, Node<Initializer<'a>>),
+    Rec {
+        left: Node<InitializerList<'a>>,
+        comma: At,
+        designation: Option<Node<Designation<'a>>>,
+        initializer: Node<Initializer<'a>>,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Designation<'a> {
@@ -826,7 +890,11 @@ pub struct Designation<'a> {
     pub equal: At,
 }
 
-pub type DesignatorList<'a> = List<Designator<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DesignatorList<'a> {
+    Leaf(Node<Designator<'a>>),
+    Rec(Node<DesignatorList<'a>>, Node<Designator<'a>>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Designator<'a> {
@@ -866,7 +934,15 @@ pub struct AttributeSpecifier<'a> {
     pub close_bracket_1: At,
 }
 
-pub type AttributeList<'a> = CommaList<Option<Attribute<'a>>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttributeList<'a> {
+    Leaf(Option<Node<Attribute<'a>>>),
+    Rec {
+        left: Node<AttributeList<'a>>,
+        comma: At,
+        right: Option<Node<Attribute<'a>>>,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attribute<'a>(
@@ -900,7 +976,11 @@ pub struct AttributeArgumentClause<'a> {
     pub close_parenthesis: At,
 }
 
-pub type BalancedTokenSequence<'a> = List<BalancedToken<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BalancedTokenSequence<'a> {
+    Leaf(Node<BalancedToken<'a>>),
+    Rec(Node<BalancedTokenSequence<'a>>, Node<BalancedToken<'a>>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BalancedToken<'a> {
@@ -981,7 +1061,11 @@ pub struct CompoundStatement<'a> {
     pub close_brace: At,
 }
 
-pub type BlockItemList<'a> = List<BlockItem<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockItemList<'a> {
+    Leaf(Node<BlockItem<'a>>),
+    Rec(Node<BlockItemList<'a>>, Node<BlockItem<'a>>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockItem<'a> {
@@ -1026,7 +1110,7 @@ pub enum SelectionStatement<'a> {
         open_parenthesis: At,
         selector: Node<Expression<'a>>,
         close_parenthesis: At,
-        body: Node<Expression<'a>>,
+        body: Node<SecondaryBlock<'a>>,
     },
 }
 
@@ -1093,7 +1177,11 @@ pub enum JumpStatement<'a> {
     },
 }
 
-pub type TranslationUnit<'a> = List<ExternalDeclaration<'a>>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TranslationUnit<'a> {
+    Leaf(Node<ExternalDeclaration<'a>>),
+    Rec(Node<TranslationUnit<'a>>, Node<ExternalDeclaration<'a>>),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExternalDeclaration<'a> {
