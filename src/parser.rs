@@ -1,255 +1,237 @@
 use std::collections::HashSet;
 
-use crate::{
-    ast::*,
-    token::{At, Token, TokenKind},
-};
+use super::ast::*;
+use crate::token::{At, Token, TokenKind};
 
 pub struct Parser<'a, 'b> {
     tokens: &'b [Token<'a>],
     index: usize,
-
-    scopes: Vec<Scope<'a>>,
+    errors: Vec<ParseErr<'a>>,
+    scopes: Vec<HashSet<&'a str>>,
 }
 impl<'a, 'b> Parser<'a, 'b> {
     pub fn new(tokens: &'b [Token<'a>]) -> Self {
         Self {
             tokens,
             index: 0,
-
+            errors: Vec::new(),
             scopes: Vec::new(),
         }
     }
 
-    fn enter_scope(&mut self) {
-        self.scopes.push(Scope {
-            typedefs: HashSet::new(),
-        });
-    }
-    fn leave_scope(&mut self) {
-        self.scopes.pop();
+    pub fn parse(mut self) -> (Result<TranslationUnit<'a>, ()>, Vec<ParseErr<'a>>) {
+        let ast = self.parse_translation_unit();
+        (ast, self.errors)
     }
 
-    pub fn parse(mut self) -> Res<'a, Node<TranslationUnit<'a>>> {
-        self.parse_translation_unit()
-    }
-
-    fn parse_primary_expression(&mut self) -> Res<'a, Node<PrimaryExpression<'a>>> {
-        let at = self.cur().at;
-        let node = match self.cur().kind {
+    fn parse_primary_expression(&mut self) -> Res<Expression<'a>> {
+        let at = self.at();
+        let kind = match self.kind() {
             TokenKind::Identifier(name) => {
                 self.next();
-                PrimaryExpression::Identifier(name)
+                ExpressionKind::Identifier(name)
             }
             TokenKind::Integer(int) => {
                 self.next();
-                PrimaryExpression::Integer(int)
+                ExpressionKind::Integer(int)
             }
             TokenKind::String(literal, encoding) => {
                 self.next();
-                PrimaryExpression::StringLiteral(StringLiteral(literal, encoding))
+                ExpressionKind::String(StringLiteral {
+                    at,
+                    literal,
+                    encoding,
+                })
             }
             TokenKind::OpenParenthesis => {
-                let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-                let inner = self.parse_expression()?;
+                let open_parenthesis = self.next();
+                let inner = Box::new(self.parse_expression()?);
                 let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-                PrimaryExpression::Parenthesized {
+                ExpressionKind::Parenthesized {
                     open_parenthesis,
                     inner,
                     close_parenthesis,
                 }
             }
-            TokenKind::Generic => PrimaryExpression::Generic(self.parse_generic_selection()?),
+            TokenKind::Generic => ExpressionKind::GenericSelection(self.parse_generic_selection()?),
             _ => {
-                self.err_expected(Expected::PrimaryExpression)?;
-                unreachable!()
+                self.err(Expected::PrimaryExpression);
+                return Err(());
             }
         };
-
-        Ok(Node::new(at, node))
+        Ok(Expression { at, kind })
     }
-
-    fn parse_generic_selection(&mut self) -> Res<'a, Node<GenericSelection<'a>>> {
+    fn parse_generic_selection(&mut self) -> Res<GenericSelection<'a>> {
+        let at = self.at();
         let generic_keyword = self.take(TokenKind::Generic)?;
         let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-        let controlling_expression = self.parse_assignment_expression()?;
+        let controlling_expression = Box::new(self.parse_assignment_expression()?);
         let comma = self.take(TokenKind::Comma)?;
-        let association_list = self.parse_generic_assoc_list()?;
+        let generic_assocs = self.parse_generic_assoc_list()?;
         let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
 
-        Ok(Node::new(
+        Ok(GenericSelection {
+            at,
             generic_keyword,
-            GenericSelection {
-                generic_keyword,
-                open_parenthesis,
-                controlling_expression,
-                comma,
-                association_list,
-                close_parenthesis,
-            },
-        ))
+            open_parenthesis,
+            controlling_expression,
+            comma,
+            generic_assocs,
+            close_parenthesis,
+        })
     }
-    fn parse_generic_assoc_list(&mut self) -> Res<'a, Node<GenericAssocList<'a>>> {
-        self.parse_comma_list(
-            Self::parse_generic_association,
-            GenericAssocList::Leaf,
-            |left, comma, right| GenericAssocList::Rec { left, comma, right },
-        )
+    fn parse_generic_assoc_list(&mut self) -> Res<GenericAssocList<'a>> {
+        self.comma_list(Self::parse_generic_association)
     }
-    fn parse_generic_association(&mut self) -> Res<'a, Node<GenericAssociation<'a>>> {
-        match self.cur().kind {
-            TokenKind::Default => {
-                let default_keyword = self.take(TokenKind::Default)?;
-                let colon = self.take(TokenKind::Colon)?;
-                let value = self.parse_assignment_expression()?;
-
-                Ok(Node::new(
-                    default_keyword,
-                    GenericAssociation::Default {
-                        default_keyword,
-                        colon,
-                        value,
-                    },
-                ))
+    fn parse_generic_association(&mut self) -> Res<GenericAssociation<'a>> {
+        let at = self.at();
+        let kind = if self.is(TokenKind::Default) {
+            GenericAssociationKind::Default {
+                default_keyword: self.next(),
             }
-            _ => {
-                let type_name = self.parse_type_name()?;
-                let colon = self.take(TokenKind::Colon)?;
-                let value = self.parse_assignment_expression()?;
-
-                Ok(Node::new(
-                    type_name.at(),
-                    GenericAssociation::ForType {
-                        type_name,
-                        colon,
-                        value,
-                    },
-                ))
-            }
-        }
-    }
-
-    fn parse_postfix_expression(&mut self) -> Res<'a, Node<PostfixExpression<'a>>> {
-        let mut left = if let Ok(primary) = self.try_to(Self::parse_primary_expression) {
-            Node::new(primary.at(), PostfixExpression::Primary(primary))
-        } else if let Ok(compound) = self.try_to(Self::parse_compound_literal) {
-            Node::new(compound.at(), PostfixExpression::CompoundLiteral(compound))
         } else {
-            self.err_expected(Expected::PostfixExpressionLeaf)?;
-            unreachable!()
+            GenericAssociationKind::ForType(self.parse_type_name()?)
         };
+        let colon = self.take(TokenKind::Colon)?;
+        let value = self.parse_assignment_expression()?;
+
+        Ok(GenericAssociation {
+            at,
+            colon,
+            kind,
+            value,
+        })
+    }
+
+    fn parse_postfix_expression(&mut self) -> Res<Expression<'a>> {
+        let mut left = self.parse_postfix_expression_leaf()?;
 
         loop {
-            match self.cur().kind {
+            let at = left.at;
+            let kind = match self.kind() {
                 TokenKind::OpenBracket => {
-                    let open_bracket = self.take(TokenKind::OpenBracket)?;
-                    let index = self.parse_expression()?;
+                    let open_bracket = self.next();
+                    let index = Box::new(self.parse_expression()?);
                     let close_bracket = self.take(TokenKind::CloseBracket)?;
-                    left = Node::new(
+                    ExpressionKind::Index {
+                        left: Box::new(left),
                         open_bracket,
-                        PostfixExpression::Index {
-                            left,
-                            open_bracket,
-                            index,
-                            close_bracket,
-                        },
-                    );
+                        index,
+                        close_bracket,
+                    }
                 }
                 TokenKind::OpenParenthesis => {
-                    let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
+                    let open_parenthesis = self.next();
                     let arguments = self.maybe(Self::parse_argument_expression_list);
                     let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-                    left = Node::new(
+                    ExpressionKind::Call {
+                        left: Box::new(left),
                         open_parenthesis,
-                        PostfixExpression::Call {
-                            left,
-                            open_parenthesis,
-                            arguments,
-                            close_parenthesis,
-                        },
-                    );
+                        arguments,
+                        close_parenthesis,
+                    }
                 }
                 TokenKind::Period => {
-                    let period = self.take(TokenKind::Period)?;
+                    let period = self.next();
                     let name = self.take_identifier()?;
-                    left = Node::new(period, PostfixExpression::Member { left, period, name });
+                    ExpressionKind::Member {
+                        left: Box::new(left),
+                        period,
+                        name,
+                    }
                 }
                 TokenKind::ArrowLeft => {
-                    let arrow = self.take(TokenKind::ArrowLeft)?;
+                    let arrow = self.next();
                     let name = self.take_identifier()?;
-                    left = Node::new(
+                    ExpressionKind::MemberIndirect {
+                        left: Box::new(left),
                         arrow,
-                        PostfixExpression::MemberIndirect { left, arrow, name },
-                    );
+                        name,
+                    }
                 }
                 TokenKind::DoublePlus => {
-                    let plus_plus = self.take(TokenKind::DoublePlus)?;
-                    left = Node::new(
-                        plus_plus,
-                        PostfixExpression::PostIncrement { left, plus_plus },
-                    );
+                    let double_plus = self.next();
+                    ExpressionKind::PostIncrement {
+                        left: Box::new(left),
+                        double_plus,
+                    }
                 }
                 TokenKind::DoubleMinus => {
-                    let minus_minus = self.take(TokenKind::DoubleMinus)?;
-                    left = Node::new(
-                        minus_minus,
-                        PostfixExpression::PostDecrement { left, minus_minus },
-                    );
+                    let double_minus = self.next();
+                    ExpressionKind::PostDecrement {
+                        left: Box::new(left),
+                        double_minus,
+                    }
                 }
                 _ => break,
-            }
+            };
+            left = Expression { at, kind };
         }
 
         Ok(left)
     }
-
-    fn parse_argument_expression_list(&mut self) -> Res<'a, Node<ArgumentExpressionList<'a>>> {
-        self.parse_comma_list(
-            Self::parse_assignment_expression,
-            ArgumentExpressionList::Leaf,
-            |left, comma, right| ArgumentExpressionList::Rec { left, comma, right },
+    fn parse_postfix_expression_leaf(&mut self) -> Res<Expression<'a>> {
+        self.one_of(
+            [
+                &mut Self::parse_compound_literal_expression,
+                &mut Self::parse_primary_expression,
+            ],
+            Expected::PrimaryExpression,
         )
     }
-    fn parse_compound_literal(&mut self) -> Res<'a, Node<CompoundLiteral<'a>>> {
+
+    fn parse_argument_expression_list(&mut self) -> Res<ArgumentExpressionList<'a>> {
+        self.comma_list(Self::parse_assignment_expression)
+    }
+
+    fn parse_compound_literal_expression(&mut self) -> Res<Expression<'a>> {
+        let literal = self.parse_compound_literal()?;
+        Ok(Expression {
+            at: literal.at,
+            kind: ExpressionKind::CompoundLiteral(literal),
+        })
+    }
+    fn parse_compound_literal(&mut self) -> Res<CompoundLiteral<'a>> {
+        let at = self.at();
         let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
         let storage_class = self.maybe(|p| Self::parse_storage_class_specifiers(p, &mut false));
         let type_name = self.parse_type_name()?;
         let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
         let initializer = self.parse_braced_initializer()?;
-        Ok(Node::new(
+        Ok(CompoundLiteral {
+            at,
             open_parenthesis,
-            CompoundLiteral {
-                open_parenthesis,
-                storage_class,
-                type_name,
-                close_parenthesis,
-                initializer,
-            },
-        ))
+            storage_class,
+            type_name,
+            close_parenthesis,
+            initializer,
+        })
     }
     fn parse_storage_class_specifiers(
         &mut self,
         is_typedef: &mut bool,
-    ) -> Res<'a, Node<StorageClassSpecifiers>> {
-        self.parse_list(
-            |p| Self::parse_storage_class_specifier(p, is_typedef),
-            StorageClassSpecifiers::Leaf,
-            StorageClassSpecifiers::Rec,
-        )
+    ) -> Res<StorageClassSpecifiers> {
+        self.list(|p| Self::parse_storage_class_specifier(p, is_typedef))
     }
 
-    fn parse_unary_expression(&mut self) -> Res<'a, Node<UnaryExpression<'a>>> {
-        let at = self.cur().at;
-        let node = match self.cur().kind {
+    fn parse_unary_expression(&mut self) -> Res<Expression<'a>> {
+        let at = self.at();
+        let kind = match self.kind() {
             TokenKind::DoublePlus => {
-                let plus_plus = self.take(TokenKind::DoublePlus)?;
+                let double_plus = self.next();
                 let right = self.parse_unary_expression()?;
-                UnaryExpression::PreIncrement { plus_plus, right }
+                ExpressionKind::PreIncrement {
+                    double_plus,
+                    right: Box::new(right),
+                }
             }
             TokenKind::DoubleMinus => {
-                let minus_minus = self.take(TokenKind::DoubleMinus)?;
+                let double_minus = self.next();
                 let right = self.parse_unary_expression()?;
-                UnaryExpression::PreDecrement { minus_minus, right }
+                ExpressionKind::PreDecrement {
+                    double_minus,
+                    right: Box::new(right),
+                }
             }
             TokenKind::Ampersand
             | TokenKind::Asterisk
@@ -257,7 +239,7 @@ impl<'a, 'b> Parser<'a, 'b> {
             | TokenKind::Minus
             | TokenKind::Tilde
             | TokenKind::Exclamation => {
-                let operator = match self.cur().kind {
+                let operator = match self.kind() {
                     TokenKind::Ampersand => UnaryOperator::AddressOf,
                     TokenKind::Asterisk => UnaryOperator::Dereference,
                     TokenKind::Plus => UnaryOperator::Positive,
@@ -267,356 +249,184 @@ impl<'a, 'b> Parser<'a, 'b> {
                     _ => unreachable!(),
                 };
                 self.next();
-
-                let operator = Node::new(at, operator);
                 let right = self.parse_cast_expression()?;
-                UnaryExpression::Operator(operator, right)
+                ExpressionKind::Unary(operator, Box::new(right))
             }
-            TokenKind::Sizeof => self.parse_sizeof_unary_expression()?,
+            TokenKind::Sizeof => {
+                let sizeof_keyword = self.next();
+                let kind = if let Ok(expr) = self.try_to(Self::parse_unary_expression) {
+                    SizeofKind::Expression(Box::new(expr))
+                } else {
+                    let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
+                    let type_name = self.parse_type_name()?;
+                    let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
+                    SizeofKind::Type {
+                        open_parenthesis,
+                        type_name,
+                        close_parenthesis,
+                    }
+                };
+
+                ExpressionKind::Sizeof {
+                    sizeof_keyword,
+                    kind,
+                }
+            }
             TokenKind::Alignof => {
-                let alignof_keyword = self.take(TokenKind::Alignof)?;
+                let alignof_keyword = self.next();
                 let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
                 let type_name = self.parse_type_name()?;
                 let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-                UnaryExpression::Alignof {
+                ExpressionKind::Alignof {
                     alignof_keyword,
                     open_parenthesis,
                     type_name,
                     close_parenthesis,
                 }
             }
-            _ => UnaryExpression::Postfix(self.parse_postfix_expression()?),
+            _ => return self.parse_postfix_expression(),
         };
 
-        Ok(Node::new(at, node))
+        Ok(Expression { at, kind })
     }
-    fn parse_sizeof_unary_expression(&mut self) -> Res<'a, UnaryExpression<'a>> {
-        let sizeof_keyword = self.take(TokenKind::Sizeof)?;
-
-        if let Ok(right) = self.try_to(Self::parse_unary_expression) {
-            Ok(UnaryExpression::SizeofValue {
-                sizeof_keyword,
-                right,
-            })
-        } else {
-            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-            let type_name = self.parse_type_name()?;
-            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-
-            Ok(UnaryExpression::SizeofType {
-                sizeof_keyword,
-                open_parenthesis,
-                type_name,
-                close_parenthesis,
-            })
-        }
-    }
-
-    fn parse_cast_expression(&mut self) -> Res<'a, Node<CastExpression<'a>>> {
-        if let Ok(e) = self.try_to(Self::parse_actual_cast_expression) {
+    fn parse_cast_expression(&mut self) -> Res<Expression<'a>> {
+        if let Ok(e) = self.try_to(Self::parse_cast_expression_prime) {
             Ok(e)
         } else {
-            let e = self.parse_unary_expression()?;
-            Ok(Node::new(e.at(), CastExpression::Unary(e)))
+            self.parse_unary_expression()
         }
     }
-    fn parse_actual_cast_expression(&mut self) -> Res<'a, Node<CastExpression<'a>>> {
+    fn parse_cast_expression_prime(&mut self) -> Res<Expression<'a>> {
+        let at = self.at();
         let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
         let type_name = self.parse_type_name()?;
         let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
         let right = self.parse_cast_expression()?;
 
-        Ok(Node::new(
-            open_parenthesis,
-            CastExpression::Cast {
+        Ok(Expression {
+            at,
+            kind: ExpressionKind::Cast {
                 open_parenthesis,
                 type_name,
                 close_parenthesis,
-                right,
+                right: Box::new(right),
             },
-        ))
+        })
     }
 
-    fn parse_multiplicative_expression(&mut self) -> Res<'a, Node<MultiplicativeExpression<'a>>> {
-        let left = self.parse_cast_expression()?;
-        let mut left = Node::new(left.at(), MultiplicativeExpression::Cast(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::Asterisk => |left, asterisk, right| MultiplicativeExpression::Multiply {
-                    left,
-                    asterisk,
-                    right,
-                },
-                TokenKind::Slash => {
-                    |left, slash, right| MultiplicativeExpression::Divide { left, slash, right }
-                }
-                TokenKind::Percent => |left, percent, right| MultiplicativeExpression::Modulo {
-                    left,
-                    percent,
-                    right,
-                },
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_cast_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_multiplicative_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_cast_expression,
+            &[
+                (TokenKind::Asterisk, BinaryOperator::Multiply),
+                (TokenKind::Slash, BinaryOperator::Divide),
+                (TokenKind::Percent, BinaryOperator::Modulo),
+            ],
+        )
     }
-    fn parse_additive_expression(&mut self) -> Res<'a, Node<AdditiveExpression<'a>>> {
-        let left = self.parse_multiplicative_expression()?;
-        let mut left = Node::new(left.at(), AdditiveExpression::Multiplicative(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::Plus => {
-                    |left, plus, right| AdditiveExpression::Add { left, plus, right }
-                }
-                TokenKind::Minus => {
-                    |left, minus, right| AdditiveExpression::Subtract { left, minus, right }
-                }
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_multiplicative_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_additive_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_multiplicative_expression,
+            &[
+                (TokenKind::Plus, BinaryOperator::Add),
+                (TokenKind::Minus, BinaryOperator::Subtract),
+            ],
+        )
     }
-    fn parse_shift_expression(&mut self) -> Res<'a, Node<ShiftExpression<'a>>> {
-        let left = self.parse_additive_expression()?;
-        let mut left = Node::new(left.at(), ShiftExpression::Additive(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::DoubleLess => |left, double_less, right| ShiftExpression::Left {
-                    left,
-                    double_less,
-                    right,
-                },
-                TokenKind::DoubleGreater => |left, double_greater, right| ShiftExpression::Right {
-                    left,
-                    double_greater,
-                    right,
-                },
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_additive_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_shift_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_additive_expression,
+            &[
+                (TokenKind::DoubleLess, BinaryOperator::ShiftLeft),
+                (TokenKind::DoubleGreater, BinaryOperator::ShiftRight),
+            ],
+        )
     }
-    fn parse_relational_expression(&mut self) -> Res<'a, Node<RelationalExpression<'a>>> {
-        let left = self.parse_shift_expression()?;
-        let mut left = Node::new(left.at(), RelationalExpression::Shift(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::Less => {
-                    |left, less, right| RelationalExpression::Less { left, less, right }
-                }
-                TokenKind::Greater => |left, greater, right| RelationalExpression::Greater {
-                    left,
-                    greater,
-                    right,
-                },
-                TokenKind::LessEqual => |left, less_equal, right| RelationalExpression::LessEqual {
-                    left,
-                    less_equal,
-                    right,
-                },
-                TokenKind::GreaterEqual => {
-                    |left, greater_equal, right| RelationalExpression::GreaterEqual {
-                        left,
-                        greater_equal,
-                        right,
-                    }
-                }
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_shift_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_relational_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_shift_expression,
+            &[
+                (TokenKind::Less, BinaryOperator::Less),
+                (TokenKind::Greater, BinaryOperator::Greater),
+                (TokenKind::LessEqual, BinaryOperator::LessEqual),
+                (TokenKind::GreaterEqual, BinaryOperator::GreaterEqual),
+            ],
+        )
     }
-    fn parse_equality_expression(&mut self) -> Res<'a, Node<EqualityExpression<'a>>> {
-        let left = self.parse_relational_expression()?;
-        let mut left = Node::new(left.at(), EqualityExpression::Relational(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::DoubleEqual => {
-                    |left, equal, right| EqualityExpression::Equal { left, equal, right }
-                }
-                TokenKind::NotEqual => |left, not_equal, right| EqualityExpression::NotEqual {
-                    left,
-                    not_equal,
-                    right,
-                },
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_relational_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_equality_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_relational_expression,
+            &[
+                (TokenKind::DoubleEqual, BinaryOperator::Equal),
+                (TokenKind::NotEqual, BinaryOperator::NotEqual),
+            ],
+        )
     }
-    fn parse_and_expression(&mut self) -> Res<'a, Node<AndExpression<'a>>> {
-        let left = self.parse_equality_expression()?;
-        let mut left = Node::new(left.at(), AndExpression::Equality(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::Ampersand => |left, ampersand, right| AndExpression::And {
-                    left,
-                    ampersand,
-                    right,
-                },
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_equality_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_and_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_equality_expression,
+            &[(TokenKind::Ampersand, BinaryOperator::BitAnd)],
+        )
     }
-    fn parse_exclusive_or_expression(&mut self) -> Res<'a, Node<ExclusiveOrExpression<'a>>> {
-        let left = self.parse_and_expression()?;
-        let mut left = Node::new(left.at(), ExclusiveOrExpression::And(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::Caret => {
-                    |left, caret, right| ExclusiveOrExpression::ExclusiveOr { left, caret, right }
-                }
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_and_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_xor_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_and_expression,
+            &[(TokenKind::Caret, BinaryOperator::BitXor)],
+        )
     }
-    fn parse_inclusive_or_expression(&mut self) -> Res<'a, Node<InclusiveOrExpression<'a>>> {
-        let left = self.parse_exclusive_or_expression()?;
-        let mut left = Node::new(left.at(), InclusiveOrExpression::ExclusiveOr(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::Bar => {
-                    |left, bar, right| InclusiveOrExpression::InclusiveOr { left, bar, right }
-                }
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_exclusive_or_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_or_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_xor_expression,
+            &[(TokenKind::Bar, BinaryOperator::BitOr)],
+        )
     }
-    fn parse_logical_and_expression(&mut self) -> Res<'a, Node<LogicalAndExpression<'a>>> {
-        let left = self.parse_inclusive_or_expression()?;
-        let mut left = Node::new(left.at(), LogicalAndExpression::InclusiveOr(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::DoubleAmpersand => {
-                    |left, double_ampersand, right| LogicalAndExpression::LogicalAnd {
-                        left,
-                        double_ampersand,
-                        right,
-                    }
-                }
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_inclusive_or_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_logical_and_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_or_expression,
+            &[(TokenKind::DoubleAmpersand, BinaryOperator::LogicalAnd)],
+        )
     }
-    fn parse_logical_or_expression(&mut self) -> Res<'a, Node<LogicalOrExpression<'a>>> {
-        let left = self.parse_logical_and_expression()?;
-        let mut left = Node::new(left.at(), LogicalOrExpression::LogicalAnd(left));
-
-        loop {
-            let operator = match self.cur().kind {
-                TokenKind::DoubleBar => |left, double_bar, right| LogicalOrExpression::LogicalOr {
-                    left,
-                    double_bar,
-                    right,
-                },
-                _ => break,
-            };
-            let op_at = self.cur().at;
-            self.next();
-            let right = self.parse_logical_and_expression()?;
-            left = Node::new(left.at(), operator(left, op_at, right));
-        }
-
-        Ok(left)
+    fn parse_logical_or_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_binary_expression(
+            Self::parse_logical_and_expression,
+            &[(TokenKind::DoubleBar, BinaryOperator::LogicalOr)],
+        )
     }
-    fn parse_conditional_expression(&mut self) -> Res<'a, Node<ConditionalExpression<'a>>> {
+    fn parse_conditional_expression(&mut self) -> Res<Expression<'a>> {
+        let at = self.at();
         let left = self.parse_logical_or_expression()?;
-
-        if self.is(TokenKind::Question) {
-            let condition = left;
-            let question = self.take(TokenKind::Question)?;
-            let then_value = self.parse_expression()?;
-            let colon = self.take(TokenKind::Colon)?;
-            let else_value = self.parse_conditional_expression()?;
-
-            Ok(Node::new(
-                condition.at(),
-                ConditionalExpression::Conditional {
-                    condition,
-                    question,
-                    then_value,
-                    colon,
-                    else_value,
-                },
-            ))
-        } else {
-            let left = Node::new(left.at(), ConditionalExpression::LogicalOr(left));
-            Ok(left)
+        if !self.is(TokenKind::Question) {
+            return Ok(left);
         }
-    }
 
-    fn parse_assignment_expression(&mut self) -> Res<'a, Node<AssignmentExpression<'a>>> {
-        if let Ok(e) = self.try_to(Self::parse_actual_assignment_expression) {
+        let condition = Box::new(left);
+        let question = self.next();
+        let then_value = Box::new(self.parse_expression()?);
+        let colon = self.take(TokenKind::Colon)?;
+        let else_value = Box::new(self.parse_conditional_expression()?);
+
+        Ok(Expression {
+            at,
+            kind: ExpressionKind::Conditional {
+                condition,
+                question,
+                then_value,
+                colon,
+                else_value,
+            },
+        })
+    }
+    fn parse_assignment_expression(&mut self) -> Res<Expression<'a>> {
+        if let Ok(e) = self.try_to(Self::parse_assignment_expression_prime) {
             Ok(e)
         } else {
-            let left = self.parse_conditional_expression()?;
-            Ok(Node::new(
-                left.at(),
-                AssignmentExpression::Conditional(left),
-            ))
+            self.parse_conditional_expression()
         }
     }
-    fn parse_actual_assignment_expression(&mut self) -> Res<'a, Node<AssignmentExpression<'a>>> {
-        let left = self.parse_unary_expression()?;
-        let operator = match self.cur().kind {
+    fn parse_assignment_expression_prime(&mut self) -> Res<Expression<'a>> {
+        let at = self.at();
+        let left = Box::new(self.parse_unary_expression()?);
+        let operator = match self.kind() {
             TokenKind::Equal => AssignmentOperator::Assign,
             TokenKind::AsteriskEqual => AssignmentOperator::Multiply,
             TokenKind::SlashEqual => AssignmentOperator::Divide,
@@ -629,644 +439,558 @@ impl<'a, 'b> Parser<'a, 'b> {
             TokenKind::CaretEqual => AssignmentOperator::Xor,
             TokenKind::BarEqual => AssignmentOperator::Or,
             _ => {
-                self.err_expected(Expected::AssignmentOperator)?;
-                unreachable!()
+                self.err(Expected::AssignmentOperator);
+                return Err(());
             }
         };
-        let operator = Node::new(self.cur().at, operator);
-        self.next();
+        let operator_at = self.next();
+        let right = Box::new(self.parse_assignment_expression()?);
 
-        let right = self.parse_assignment_expression()?;
-
-        Ok(Node::new(
-            left.at(),
-            AssignmentExpression::Assignment {
+        Ok(Expression {
+            at,
+            kind: ExpressionKind::Assign {
                 left,
-                operator,
+                operator: (operator_at, operator),
                 right,
             },
-        ))
+        })
     }
+    fn parse_expression(&mut self) -> Res<Expression<'a>> {
+        let mut left = self.parse_assignment_expression()?;
 
-    fn parse_expression(&mut self) -> Res<'a, Node<Expression<'a>>> {
-        self.parse_comma_list(
-            Self::parse_assignment_expression,
-            Expression::Assign,
-            |left, comma, right| Expression::Comma { left, comma, right },
-        )
-    }
-
-    fn parse_constant_expression(&mut self) -> Res<'a, Node<ConstantExpression<'a>>> {
-        let inner = self.parse_conditional_expression()?;
-        Ok(Node::new(inner.at(), ConstantExpression(inner)))
-    }
-
-    fn parse_declaration(&mut self) -> Res<'a, Node<Declaration<'a>>> {
-        if let Ok(assert) = self.try_to(Self::parse_static_assert_declaration) {
-            Ok(Node::new(assert.at(), Declaration::Assert(assert)))
-        } else if let Ok(attribute) = self.try_to(Self::parse_attribute_declaration) {
-            Ok(Node::new(attribute.at(), Declaration::Attribute(attribute)))
-        } else if let Ok(attributes) = self.try_to(Self::parse_attribute_specifier_sequence) {
-            let mut is_typedef = false;
-            let specifiers = self.parse_declaration_specifiers(&mut is_typedef)?;
-            let declarators = self.parse_init_declarator_list(is_typedef)?;
-            let semicolon = self.take(TokenKind::Semicolon)?;
-
-            Ok(Node::new(
-                attributes.at(),
-                Declaration::WithAttributes {
-                    attributes,
-                    specifiers,
-                    declarators,
-                    semicolon,
+        loop {
+            if !self.is(TokenKind::Comma) {
+                break;
+            }
+            let comma = self.next();
+            let right = Box::new(self.parse_assignment_expression()?);
+            left = Expression {
+                at: left.at,
+                kind: ExpressionKind::Comma {
+                    left: Box::new(left),
+                    comma,
+                    right,
                 },
-            ))
-        } else {
-            let mut is_typedef = false;
-            let specifiers = self.parse_declaration_specifiers(&mut is_typedef)?;
-            let declarators = self.maybe(|p| Self::parse_init_declarator_list(p, is_typedef));
-            let semicolon = self.take(TokenKind::Semicolon)?;
-            Ok(Node::new(
-                specifiers.at(),
-                Declaration::Normal {
-                    specifiers,
-                    declarators,
-                    semicolon,
-                },
-            ))
+            }
         }
+
+        Ok(left)
+    }
+    fn parse_constant_expression(&mut self) -> Res<Expression<'a>> {
+        self.parse_conditional_expression()
     }
 
+    fn parse_declaration(&mut self) -> Res<Declaration<'a>> {
+        let mut is_typedef = false;
+
+        let at = self.at();
+        let kind = if let Ok(assert) = self.try_to(Self::parse_static_assert_declaration) {
+            DeclarationKind::Assert(assert)
+        } else if let Ok(attribute) = self.try_to(Self::parse_attribute_declaration) {
+            DeclarationKind::Attribute(attribute)
+        } else if let Ok(attribute) = self.try_to(Self::parse_attribute_specifier_sequence) {
+            let specifiers = self.parse_declaration_specifiers(&mut is_typedef)?;
+            let init_declarators = self.parse_init_declarator_list(is_typedef)?;
+            let semicolon = self.take(TokenKind::Semicolon)?;
+
+            DeclarationKind::Normal {
+                attributes: Some(attribute),
+                specifiers,
+                init_declarators: Some(init_declarators),
+                semicolon,
+            }
+        } else {
+            let specifiers = self.parse_declaration_specifiers(&mut is_typedef)?;
+            let init_declarators = self.maybe(|p| Self::parse_init_declarator_list(p, is_typedef));
+            let semicolon = self.take(TokenKind::Semicolon)?;
+            DeclarationKind::Normal {
+                attributes: None,
+                specifiers,
+                init_declarators,
+                semicolon,
+            }
+        };
+
+        Ok(Declaration { at, kind })
+    }
     fn parse_declaration_specifiers(
         &mut self,
         is_typedef: &mut bool,
-    ) -> Res<'a, Node<DeclarationSpecifiers<'a>>> {
+    ) -> Res<DeclarationSpecifiers<'a>> {
+        let at = self.at();
         let specifier = self.parse_declaration_specifier(is_typedef)?;
-        if let Ok(cons) = self.try_to(|p| Self::parse_declaration_specifiers(p, is_typedef)) {
-            Ok(Node::new(
-                specifier.at(),
-                DeclarationSpecifiers::Rec(specifier, cons),
-            ))
-        } else {
-            let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
-            Ok(Node::new(
-                specifier.at(),
-                DeclarationSpecifiers::Leaf(specifier, attributes),
-            ))
-        }
+        let kind =
+            if let Ok(cons) = self.try_to(|p| Self::parse_declaration_specifiers(p, is_typedef)) {
+                DeclarationSpecifiersKind::Cons(Box::new(cons))
+            } else {
+                let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
+                DeclarationSpecifiersKind::Leaf(attributes)
+            };
+
+        Ok(DeclarationSpecifiers {
+            at,
+            specifier,
+            kind,
+        })
     }
     fn parse_declaration_specifier(
         &mut self,
         is_typedef: &mut bool,
-    ) -> Res<'a, Node<DeclarationSpecifier<'a>>> {
-        if let Ok(storage_class) =
-            self.try_to(|p| Self::parse_storage_class_specifier(p, is_typedef))
-        {
-            Ok(Node::new(
-                storage_class.at(),
-                DeclarationSpecifier::StorageClass(storage_class),
-            ))
-        } else if let Ok(type_spec) = self.try_to(Self::parse_type_specifier_qualifier) {
-            Ok(Node::new(
-                type_spec.at(),
-                DeclarationSpecifier::TypeSpecifier(type_spec),
-            ))
-        } else if let Ok(func) = self.try_to(Self::parse_function_specifier) {
-            Ok(Node::new(
-                func.at(),
-                DeclarationSpecifier::FunctionSpecifier(func),
-            ))
-        } else {
-            self.err_expected(Expected::DeclarationSpecifier)?;
-            unreachable!()
-        }
-    }
-    fn parse_init_declarator_list(
-        &mut self,
-        is_typedef: bool,
-    ) -> Res<'a, Node<InitDeclaratorList<'a>>> {
-        self.parse_comma_list(
-            |p| Self::parse_init_declarator(p, is_typedef),
-            InitDeclaratorList::Leaf,
-            |left, comma, right| InitDeclaratorList::Rec { left, comma, right },
+    ) -> Res<DeclarationSpecifier<'a>> {
+        self.one_of(
+            [
+                &mut |p| Ok(p.parse_storage_class_specifier(is_typedef)?.into()),
+                &mut |p| Ok(p.parse_type_specifier_qualifier()?.into()),
+                &mut |p| Ok(p.parse_function_specifier()?.into()),
+            ],
+            Expected::DeclarationSpecifier,
         )
     }
-    fn parse_init_declarator(&mut self, is_typedef: bool) -> Res<'a, Node<InitDeclarator<'a>>> {
-        let declarator = self.parse_declarator(is_typedef)?;
-        if self.is(TokenKind::Equal) {
-            let equal = self.take(TokenKind::Equal)?;
-            let initializer = self.parse_initializer()?;
-
-            Ok(Node::new(
-                declarator.at(),
-                InitDeclarator::Initializer {
-                    declarator,
-                    equal,
-                    initializer,
-                },
-            ))
-        } else {
-            Ok(Node::new(
-                declarator.at(),
-                InitDeclarator::NoInitializer(declarator),
-            ))
-        }
+    fn parse_init_declarator_list(&mut self, is_typedef: bool) -> Res<InitDeclaratorList<'a>> {
+        self.comma_list(|p| Self::parse_init_declarator(p, is_typedef))
     }
-    fn parse_attribute_declaration(&mut self) -> Res<'a, Node<AttributeDeclaration<'a>>> {
+    fn parse_init_declarator(&mut self, is_typedef: bool) -> Res<InitDeclarator<'a>> {
+        let at = self.at();
+        let declarator = self.parse_declarator(is_typedef)?;
+        let initializer = if self.is(TokenKind::Equal) {
+            let equal = self.next();
+            let initializer = self.parse_initializer()?;
+            Some((equal, initializer))
+        } else {
+            None
+        };
+
+        Ok(InitDeclarator {
+            at,
+            declarator,
+            initializer,
+        })
+    }
+    fn parse_attribute_declaration(&mut self) -> Res<AttributeDeclaration<'a>> {
+        let at = self.at();
         let attributes = self.parse_attribute_specifier_sequence()?;
         let semicolon = self.take(TokenKind::Semicolon)?;
-        Ok(Node::new(
-            attributes.at(),
-            AttributeDeclaration {
-                attributes,
-                semicolon,
-            },
-        ))
+        Ok(AttributeDeclaration {
+            at,
+            attributes,
+            semicolon,
+        })
     }
     fn parse_storage_class_specifier(
         &mut self,
         is_typedef: &mut bool,
-    ) -> Res<'a, Node<StorageClassSpecifier>> {
-        let specifier = match self.cur().kind {
-            TokenKind::Auto => StorageClassSpecifier::Auto,
-            TokenKind::Constexpr => StorageClassSpecifier::Constexpr,
-            TokenKind::Extern => StorageClassSpecifier::Extern,
-            TokenKind::Register => StorageClassSpecifier::Register,
-            TokenKind::Static => StorageClassSpecifier::Static,
-            TokenKind::ThreadLocal => StorageClassSpecifier::ThreadLocal,
-            TokenKind::Typedef => StorageClassSpecifier::Typedef,
+    ) -> Res<StorageClassSpecifier> {
+        let at = self.at();
+        let kind = match self.kind() {
+            TokenKind::Auto => StorageClassSpecifierKind::Auto,
+            TokenKind::Constexpr => StorageClassSpecifierKind::Constexpr,
+            TokenKind::Extern => StorageClassSpecifierKind::Extern,
+            TokenKind::Register => StorageClassSpecifierKind::Register,
+            TokenKind::Static => StorageClassSpecifierKind::Static,
+            TokenKind::ThreadLocal => StorageClassSpecifierKind::ThreadLocal,
+            TokenKind::Typedef => {
+                *is_typedef = true;
+                StorageClassSpecifierKind::Typedef
+            }
             _ => {
-                self.err_expected(Expected::StorageClassSpecifier)?;
-                unreachable!()
+                self.err(Expected::StorageClassSpecifier);
+                return Err(());
             }
         };
-        let at = self.cur().at;
         self.next();
 
-        if specifier == StorageClassSpecifier::Typedef {
-            *is_typedef = true;
-        }
-
-        Ok(Node::new(at, specifier))
+        Ok(StorageClassSpecifier { at, kind })
     }
-    fn parse_type_specifier(&mut self) -> Res<'a, Node<TypeSpecifier<'a>>> {
-        let at = self.cur().at;
-        let specifier = match self.cur().kind {
+    fn parse_type_specifier(&mut self) -> Res<TypeSpecifier<'a>> {
+        let at = self.at();
+        let kind = match self.kind() {
             TokenKind::Void => {
                 self.next();
-                TypeSpecifier::Void
+                TypeSpecifierKind::Void
             }
             TokenKind::Char => {
                 self.next();
-                TypeSpecifier::Char
+                TypeSpecifierKind::Char
             }
             TokenKind::Short => {
                 self.next();
-                TypeSpecifier::Short
+                TypeSpecifierKind::Short
             }
             TokenKind::Int => {
                 self.next();
-                TypeSpecifier::Int
+                TypeSpecifierKind::Int
             }
             TokenKind::Long => {
                 self.next();
-                TypeSpecifier::Long
+                TypeSpecifierKind::Long
             }
             TokenKind::Float => {
                 self.next();
-                TypeSpecifier::Float
+                TypeSpecifierKind::Float
             }
             TokenKind::Double => {
                 self.next();
-                TypeSpecifier::Double
+                TypeSpecifierKind::Double
             }
             TokenKind::Signed => {
                 self.next();
-                TypeSpecifier::Signed
+                TypeSpecifierKind::Signed
             }
             TokenKind::Unsigned => {
                 self.next();
-                TypeSpecifier::Unsigned
+                TypeSpecifierKind::Unsigned
+            }
+            TokenKind::Bool => {
+                self.next();
+                TypeSpecifierKind::Bool
+            }
+            TokenKind::Complex => {
+                self.next();
+                TypeSpecifierKind::Complex
+            }
+            TokenKind::Decimal32 => {
+                self.next();
+                TypeSpecifierKind::Decimal32
+            }
+            TokenKind::Decimal64 => {
+                self.next();
+                TypeSpecifierKind::Decimal64
+            }
+            TokenKind::Decimal128 => {
+                self.next();
+                TypeSpecifierKind::Decimal128
+            }
+            TokenKind::Identifier(name) => {
+                if !self.is_typedef_name(name) {
+                    self.err(Expected::TypeSpecifier);
+                    return Err(());
+                }
+                self.next();
+                TypeSpecifierKind::TypedefName(name)
             }
             TokenKind::BitInt => {
-                let bitint_keyword = self.take(TokenKind::BitInt)?;
+                let bitint_keyword = self.next();
                 let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
                 let width = self.parse_constant_expression()?;
                 let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-
-                TypeSpecifier::BitInt {
+                TypeSpecifierKind::BitInt {
                     bitint_keyword,
                     open_parenthesis,
                     width,
                     close_parenthesis,
                 }
             }
-            TokenKind::Bool => {
-                self.next();
-                TypeSpecifier::Bool
-            }
-            TokenKind::Complex => {
-                self.next();
-                TypeSpecifier::Complex
-            }
-            TokenKind::Decimal32 => {
-                self.next();
-                TypeSpecifier::Decimal32
-            }
-            TokenKind::Decimal64 => {
-                self.next();
-                TypeSpecifier::Decimal64
-            }
-            TokenKind::Decimal128 => {
-                self.next();
-                TypeSpecifier::Decimal128
-            }
-            _ => {
-                if let Ok(atomic) = self.try_to(Self::parse_atomic_type_specifier) {
-                    TypeSpecifier::Atomic(atomic)
-                } else if let Ok(struct_or_union) =
-                    self.try_to(Self::parse_struct_or_union_specifier)
-                {
-                    TypeSpecifier::StructOrUnion(struct_or_union)
-                } else if let Ok(enum_spec) = self.try_to(Self::parse_enum_specifier) {
-                    TypeSpecifier::Enum(enum_spec)
-                } else if let Ok(typedef) = self.try_to(Self::parse_typedef_name) {
-                    TypeSpecifier::TypedefName(typedef)
-                } else if let Ok(typeof_spec) = self.try_to(Self::parse_typeof_specifier) {
-                    TypeSpecifier::Typeof(typeof_spec)
-                } else {
-                    self.err_expected(Expected::TypeSpecifier)?;
-                    unreachable!()
-                }
-            }
+            _ => self.one_of(
+                [
+                    &mut |p| Ok(p.parse_atomic_type_specifier()?.into()),
+                    &mut |p| Ok(p.parse_struct_or_union_specifier()?.into()),
+                    &mut |p| Ok(p.parse_enum_specifier()?.into()),
+                    &mut |p| Ok(p.parse_typeof_specifier()?.into()),
+                ],
+                Expected::TypeSpecifier,
+            )?,
         };
 
-        Ok(Node::new(at, specifier))
+        Ok(TypeSpecifier { at, kind })
     }
-    fn parse_struct_or_union_specifier(&mut self) -> Res<'a, Node<StructOrUnionSpecifier<'a>>> {
-        let struct_or_union = self.parse_struct_or_union()?;
+    fn parse_struct_or_union_specifier(&mut self) -> Res<StructOrUnionSpecifier<'a>> {
+        let at = self.at();
+        let struct_or_union = (at, self.parse_struct_or_union()?);
         let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
-
-        let parse_with_list = |parser: &mut Self| {
-            let tag = parser.maybe(Self::take_identifier);
-            let open_brace = parser.take(TokenKind::OpenBrace)?;
-            let members = parser.parse_member_declaration_list()?;
-            let close_brace = parser.take(TokenKind::CloseBrace)?;
-
-            Ok((tag, open_brace, members, close_brace))
+        let tag = self.maybe(Self::take_identifier);
+        let members = if self.is(TokenKind::OpenBrace) || tag.is_none() {
+            let open_brace = self.take(TokenKind::OpenBrace)?;
+            let members = self.parse_member_declaration_list()?;
+            let close_brace = self.take(TokenKind::CloseBrace)?;
+            Some((open_brace, members, close_brace))
+        } else {
+            None
         };
 
-        if let Ok((tag, open_brace, members, close_brace)) = self.try_to(parse_with_list) {
-            Ok(Node::new(
-                struct_or_union.at(),
-                StructOrUnionSpecifier::WithMembers {
-                    struct_or_union,
-                    attributes,
-                    tag,
-                    open_brace,
-                    members,
-                    close_brace,
-                },
-            ))
-        } else {
-            let tag = self.take_identifier()?;
-            Ok(Node::new(
-                struct_or_union.at(),
-                StructOrUnionSpecifier::WithoutMembers(struct_or_union, attributes, tag),
-            ))
-        }
+        Ok(StructOrUnionSpecifier {
+            at,
+            struct_or_union,
+            attributes,
+            tag,
+            members,
+        })
     }
-    fn parse_struct_or_union(&mut self) -> Res<'a, Node<StructOrUnion>> {
-        let at = self.cur().at;
-        let kind = match self.cur().kind {
+    fn parse_struct_or_union(&mut self) -> Res<StructOrUnion> {
+        let out = match self.kind() {
             TokenKind::Struct => StructOrUnion::Struct,
             TokenKind::Union => StructOrUnion::Union,
             _ => {
-                self.err_expected(Expected::StructOrUnion)?;
-                unreachable!()
+                self.err(Expected::StructOrUnion);
+                return Err(());
             }
         };
-
-        Ok(Node::new(at, kind))
+        self.next();
+        Ok(out)
     }
-    fn parse_member_declaration_list(&mut self) -> Res<'a, Node<MemberDeclarationList<'a>>> {
-        self.parse_list(
-            Self::parse_member_declaration,
-            MemberDeclarationList::Leaf,
-            MemberDeclarationList::Rec,
-        )
+    fn parse_member_declaration_list(&mut self) -> Res<MemberDeclarationList<'a>> {
+        self.list(Self::parse_member_declaration)
     }
-    fn parse_member_declaration(&mut self) -> Res<'a, Node<MemberDeclaration<'a>>> {
+    fn parse_member_declaration(&mut self) -> Res<MemberDeclaration<'a>> {
         if let Ok(assert) = self.try_to(Self::parse_static_assert_declaration) {
-            Ok(Node::new(assert.at(), MemberDeclaration::Assert(assert)))
+            Ok(MemberDeclaration {
+                at: assert.at,
+                kind: MemberDeclarationKind::Assert(assert),
+            })
         } else {
+            let at = self.at();
             let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
-            let specifiers = self.parse_specifier_qualifier_list()?;
-            let declarators = self.maybe(Self::parse_member_declarator_list);
+            let specifier_qualifiers = self.parse_specifier_qualifier_list()?;
+            let member_declarators = self.maybe(Self::parse_member_declarator_list);
             let semicolon = self.take(TokenKind::Semicolon)?;
-
-            Ok(Node::new(
-                attributes
-                    .as_ref()
-                    .map(|a| a.at())
-                    .unwrap_or(specifiers.at()),
-                MemberDeclaration::Member {
+            Ok(MemberDeclaration {
+                at,
+                kind: MemberDeclarationKind::Member {
                     attributes,
-                    specifiers,
-                    declarators,
+                    specifier_qualifiers,
+                    member_declarators,
                     semicolon,
                 },
-            ))
+            })
         }
     }
-    fn parse_specifier_qualifier_list(&mut self) -> Res<'a, Node<SpecifierQualifierList<'a>>> {
-        let specifier = self.parse_type_specifier_qualifier()?;
-
-        if let Ok(cons) = self.try_to(Self::parse_specifier_qualifier_list) {
-            Ok(Node::new(
-                specifier.at(),
-                SpecifierQualifierList::Rec(specifier, cons),
-            ))
+    fn parse_specifier_qualifier_list(&mut self) -> Res<SpecifierQualifierList<'a>> {
+        let at = self.at();
+        let specifier_qualifier = Box::new(self.parse_type_specifier_qualifier()?);
+        let kind = if let Ok(cons) = self.try_to(Self::parse_specifier_qualifier_list) {
+            SpecifierQualifierListKind::Cons(Box::new(cons))
         } else {
             let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
-            Ok(Node::new(
-                specifier.at(),
-                SpecifierQualifierList::Leaf(specifier, attributes),
-            ))
-        }
-    }
-    fn parse_type_specifier_qualifier(&mut self) -> Res<'a, Node<TypeSpecifierQualifier<'a>>> {
-        if let Ok(specifier) = self.try_to(Self::parse_type_specifier) {
-            Ok(Node::new(
-                specifier.at(),
-                TypeSpecifierQualifier::TypeSpecifier(specifier),
-            ))
-        } else if let Ok(qualifier) = self.try_to(Self::parse_type_qualifier) {
-            Ok(Node::new(
-                qualifier.at(),
-                TypeSpecifierQualifier::TypeQualifier(qualifier),
-            ))
-        } else if let Ok(alignment) = self.try_to(Self::parse_alignment_specifier) {
-            Ok(Node::new(
-                alignment.at(),
-                TypeSpecifierQualifier::AlignmentSpecifier(alignment),
-            ))
-        } else {
-            self.err_expected(Expected::TypeSpecifierQualifier)?;
-            unreachable!()
-        }
-    }
-    fn parse_member_declarator_list(&mut self) -> Res<'a, Node<MemberDeclaratorList<'a>>> {
-        self.parse_comma_list(
-            Self::parse_member_declarator,
-            MemberDeclaratorList::Leaf,
-            |left, comma, right| MemberDeclaratorList::Rec { left, comma, right },
-        )
-    }
-    fn parse_member_declarator(&mut self) -> Res<'a, Node<MemberDeclarator<'a>>> {
-        let at = self.cur().at;
-
-        let parse_with_colon = |parser: &mut Self| {
-            let declarator = parser.maybe(|p| Self::parse_declarator(p, false));
-            let colon = parser.take(TokenKind::Colon)?;
-            let value = parser.parse_constant_expression()?;
-            Ok((declarator, colon, value))
+            SpecifierQualifierListKind::Leaf(attributes)
         };
 
-        if let Ok((declarator, colon, width)) = self.try_to(parse_with_colon) {
-            Ok(Node::new(
-                at,
-                MemberDeclarator::WithWidth {
-                    declarator,
-                    colon,
-                    width,
-                },
-            ))
-        } else {
-            let declarator = self.parse_declarator(false)?;
-            Ok(Node::new(at, MemberDeclarator::WithoutWidth(declarator)))
-        }
+        Ok(SpecifierQualifierList {
+            at,
+            specifier_qualifier,
+            kind,
+        })
     }
-    fn parse_enum_specifier(&mut self) -> Res<'a, Node<EnumSpecifier<'a>>> {
+    fn parse_type_specifier_qualifier(&mut self) -> Res<TypeSpecifierQualifier<'a>> {
+        self.one_of(
+            [
+                &mut |p| Ok(p.parse_type_specifier()?.into()),
+                &mut |p| Ok(p.parse_type_qualifier()?.into()),
+                &mut |p| Ok(p.parse_alignment_specifier()?.into()),
+            ],
+            Expected::TypeSpecifierQualifier,
+        )
+    }
+    fn parse_member_declarator_list(&mut self) -> Res<MemberDeclaratorList<'a>> {
+        self.comma_list(Self::parse_member_declarator)
+    }
+    fn parse_member_declarator(&mut self) -> Res<MemberDeclarator<'a>> {
+        if let Ok(m) = self.try_to(Self::parse_member_declarator_prime) {
+            return Ok(m);
+        }
+
+        let declarator = self.parse_declarator(false)?;
+
+        Ok(MemberDeclarator {
+            at: declarator.at,
+            declarator: Some(declarator),
+            width: None,
+        })
+    }
+    fn parse_member_declarator_prime(&mut self) -> Res<MemberDeclarator<'a>> {
+        let at = self.at();
+        let declarator = self.maybe(|p| Self::parse_declarator(p, false));
+        let colon = self.take(TokenKind::Colon)?;
+        let width = self.parse_constant_expression()?;
+
+        Ok(MemberDeclarator {
+            at,
+            declarator,
+            width: Some((colon, width)),
+        })
+    }
+    fn parse_enum_specifier(&mut self) -> Res<EnumSpecifier<'a>> {
+        let at = self.at();
         let enum_keyword = self.take(TokenKind::Enum)?;
+        let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
+        let tag_at = self.cur();
+        let tag = self.maybe(Self::take_identifier);
+        let enum_type = self.maybe(Self::parse_enum_type_specifier);
 
-        let parse_with_members = |parser: &mut Self| {
-            let attributes = parser.maybe(Self::parse_attribute_specifier_sequence);
-            let tag = parser.maybe(Self::take_identifier);
-            let enum_type = parser.maybe(Self::parse_enum_type_specifier);
-            let open_brace = parser.take(TokenKind::OpenBrace)?;
-            let members = parser.parse_enumerator_list()?;
-            let comma = parser.maybe(|p| p.take(TokenKind::Comma));
-            let close_brace = parser.take(TokenKind::CloseBrace)?;
-            Ok((
-                attributes,
-                tag,
-                enum_type,
-                open_brace,
-                members,
-                comma,
-                close_brace,
-            ))
+        let enumerators = if self.is(TokenKind::OpenBrace) {
+            let open_brace = self.next();
+            let enumerators = self.parse_enumerator_list()?;
+            let final_comma = self.maybe(|p| p.take(TokenKind::Comma));
+            let close_brace = self.take(TokenKind::CloseBrace)?;
+
+            Some((open_brace, enumerators, final_comma, close_brace))
+        } else {
+            if tag.is_none() {
+                self.err_at(tag_at, Expected::Identifier);
+            }
+            None
         };
 
-        if let Ok((attributes, tag, enum_type, open_brace, enumerators, final_comma, close_brace)) =
-            self.try_to(parse_with_members)
-        {
-            Ok(Node::new(
-                enum_keyword,
-                EnumSpecifier::WithList {
-                    enum_keyword,
-                    attributes,
-                    tag,
-                    enum_type,
-                    open_brace,
-                    enumerators,
-                    final_comma,
-                    close_brace,
-                },
-            ))
-        } else {
-            let tag = self.take_identifier()?;
-            let enum_type = self.maybe(Self::parse_enum_type_specifier);
-            Ok(Node::new(
-                enum_keyword,
-                EnumSpecifier::WithoutList {
-                    enum_keyword,
-                    tag,
-                    enum_type,
-                },
-            ))
-        }
+        Ok(EnumSpecifier {
+            at,
+            enum_keyword,
+            attributes,
+            tag,
+            enum_type,
+            enumerators,
+        })
     }
-    fn parse_enumerator_list(&mut self) -> Res<'a, Node<EnumeratorList<'a>>> {
-        self.parse_comma_list(
-            Self::parse_enumerator,
-            EnumeratorList::Leaf,
-            |left, comma, right| EnumeratorList::Rec { left, comma, right },
-        )
+    fn parse_enumerator_list(&mut self) -> Res<EnumeratorList<'a>> {
+        self.comma_list(Self::parse_enumerator)
     }
-    fn parse_enumerator(&mut self) -> Res<'a, Node<Enumerator<'a>>> {
-        let at = self.cur().at;
+    fn parse_enumerator(&mut self) -> Res<Enumerator<'a>> {
+        let at = self.at();
         let name = self.take_identifier()?;
         let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
-
-        if self.is(TokenKind::Equal) {
-            let equal = self.take(TokenKind::Equal)?;
+        let value = if self.is(TokenKind::Equal) {
+            let equal = self.next();
             let value = self.parse_constant_expression()?;
-            Ok(Node::new(
-                at,
-                Enumerator::WithValue {
-                    name,
-                    attributes,
-                    equal,
-                    value,
-                },
-            ))
+            Some((equal, value))
         } else {
-            Ok(Node::new(at, Enumerator::WithoutValue(name, attributes)))
-        }
+            None
+        };
+
+        Ok(Enumerator {
+            at,
+            name,
+            attributes,
+            value,
+        })
     }
-    fn parse_enum_type_specifier(&mut self) -> Res<'a, Node<EnumTypeSpecifier<'a>>> {
+    fn parse_enum_type_specifier(&mut self) -> Res<EnumTypeSpecifier<'a>> {
+        let at = self.at();
         let colon = self.take(TokenKind::Colon)?;
-        let specifiers = self.parse_specifier_qualifier_list()?;
-        Ok(Node::new(colon, EnumTypeSpecifier { colon, specifiers }))
+        let specifier_qualifiers = self.parse_specifier_qualifier_list()?;
+
+        Ok(EnumTypeSpecifier {
+            at,
+            colon,
+            specifier_qualifiers,
+        })
     }
-    fn parse_atomic_type_specifier(&mut self) -> Res<'a, Node<AtomicTypeSpecifier<'a>>> {
+    fn parse_atomic_type_specifier(&mut self) -> Res<AtomicTypeSpecifier<'a>> {
+        let at = self.at();
         let atomic_keyword = self.take(TokenKind::Atomic)?;
         let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
         let type_name = self.parse_type_name()?;
         let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
 
-        Ok(Node::new(
+        Ok(AtomicTypeSpecifier {
+            at,
             atomic_keyword,
-            AtomicTypeSpecifier {
-                atomic_keyword,
-                open_parenthesis,
-                type_name,
-                close_parenthesis,
-            },
-        ))
+            open_parenthesis,
+            type_name,
+            close_parenthesis,
+        })
     }
-    fn parse_typeof_specifier(&mut self) -> Res<'a, Node<TypeofSpecifier<'a>>> {
-        if self.is(TokenKind::Typeof) {
-            let typeof_keyword = self.take(TokenKind::Typeof)?;
-            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-            let argument = self.parse_typeof_specifier_argument()?;
-            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-
-            Ok(Node::new(
-                typeof_keyword,
-                TypeofSpecifier::Typeof {
-                    typeof_keyword,
-                    open_parenthesis,
-                    argument,
-                    close_parenthesis,
-                },
-            ))
-        } else if self.is(TokenKind::TypeofUnqual) {
-            let typeof_unqual_keyword = self.take(TokenKind::TypeofUnqual)?;
-            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-            let argument = self.parse_typeof_specifier_argument()?;
-            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-
-            Ok(Node::new(
-                typeof_unqual_keyword,
-                TypeofSpecifier::TypeofUnqual {
-                    typeof_unqual_keyword,
-                    open_parenthesis,
-                    argument,
-                    close_parenthesis,
-                },
-            ))
+    fn parse_typeof_specifier(&mut self) -> Res<TypeofSpecifier<'a>> {
+        let at = self.at();
+        let (typeof_keyword, unqual) = if self.is(TokenKind::TypeofUnqual) {
+            (self.next(), true)
         } else {
-            self.err_expected(Expected::Typeof)?;
-            unreachable!()
-        }
+            (self.take(TokenKind::Typeof)?, false)
+        };
+
+        let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
+        let argument = self.parse_typeof_specifier_argument()?;
+        let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
+
+        Ok(TypeofSpecifier {
+            at,
+            typeof_keyword,
+            unqual,
+            open_parenthesis,
+            argument,
+            close_parenthesis,
+        })
     }
-    fn parse_typeof_specifier_argument(&mut self) -> Res<'a, Node<TypeofSpecifierArgument<'a>>> {
-        if let Ok(expr) = self.try_to(Self::parse_expression) {
-            Ok(Node::new(
-                expr.at(),
-                TypeofSpecifierArgument::Expression(expr),
-            ))
-        } else {
-            let type_name = self.parse_type_name()?;
-            Ok(Node::new(
-                type_name.at(),
-                TypeofSpecifierArgument::Type(type_name),
-            ))
-        }
+    fn parse_typeof_specifier_argument(&mut self) -> Res<TypeofSpecifierArgument<'a>> {
+        let at = self.at();
+        let kind = self.one_of(
+            [
+                &mut |p| {
+                    Ok(TypeofSpecifierArgumentKind::Expression(
+                        p.parse_expression()?,
+                    ))
+                },
+                &mut |p| Ok(TypeofSpecifierArgumentKind::Type(p.parse_type_name()?)),
+            ],
+            Expected::TypeofSpecifierArgument,
+        )?;
+
+        Ok(TypeofSpecifierArgument { at, kind })
     }
-    fn parse_type_qualifier(&mut self) -> Res<'a, Node<TypeQualifier>> {
-        let kind = match self.cur().kind {
-            TokenKind::Const => TypeQualifier::Const,
-            TokenKind::Restrict => TypeQualifier::Restrict,
-            TokenKind::Volatile => TypeQualifier::Volatile,
-            TokenKind::Atomic => TypeQualifier::Atomic,
+    fn parse_type_qualifier(&mut self) -> Res<TypeQualifier> {
+        let at = self.at();
+        let kind = match self.kind() {
+            TokenKind::Const => TypeQualifierKind::Const,
+            TokenKind::Restrict => TypeQualifierKind::Restrict,
+            TokenKind::Volatile => TypeQualifierKind::Volatile,
+            TokenKind::Atomic => TypeQualifierKind::Atomic,
             _ => {
-                self.err_expected(Expected::TypeQualifier)?;
-                unreachable!()
+                self.err(Expected::TypeQualifier);
+                return Err(());
             }
         };
-        let at = self.cur().at;
-        self.next();
-        Ok(Node::new(at, kind))
+
+        Ok(TypeQualifier { at, kind })
     }
-    fn parse_function_specifier(&mut self) -> Res<'a, Node<FunctionSpecifier>> {
-        let kind = match self.cur().kind {
-            TokenKind::Inline => FunctionSpecifier::Inline,
-            TokenKind::Noreturn => FunctionSpecifier::NoReturn,
+    fn parse_function_specifier(&mut self) -> Res<FunctionSpecifier> {
+        let at = self.at();
+        let kind = match self.kind() {
+            TokenKind::Inline => FunctionSpecifierKind::Inline,
+            TokenKind::Noreturn => FunctionSpecifierKind::NoReturn,
             _ => {
-                self.err_expected(Expected::TypeQualifier)?;
-                unreachable!()
+                self.err(Expected::TypeQualifier);
+                return Err(());
             }
         };
-        let at = self.cur().at;
-        self.next();
-        Ok(Node::new(at, kind))
+
+        Ok(FunctionSpecifier { at, kind })
     }
-    fn parse_alignment_specifier(&mut self) -> Res<'a, Node<AlignmentSpecifier<'a>>> {
+    fn parse_alignment_specifier(&mut self) -> Res<AlignmentSpecifier<'a>> {
+        let at = self.at();
         let alignas_keyword = self.take(TokenKind::Alignas)?;
         let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
+        let kind = self.one_of(
+            [
+                &mut |p| {
+                    Ok(AlignmentSpecifierKind::Expression(
+                        p.parse_constant_expression()?,
+                    ))
+                },
+                &mut |p| Ok(AlignmentSpecifierKind::Type(p.parse_type_name()?)),
+            ],
+            Expected::AlignasArgument,
+        )?;
 
-        if let Ok(type_name) = self.try_to(Self::parse_type_name) {
-            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-            Ok(Node::new(
-                alignas_keyword,
-                AlignmentSpecifier::AsType {
-                    alignas_keyword,
-                    open_parenthesis,
-                    type_name,
-                    close_parenthesis,
-                },
-            ))
-        } else {
-            let expression = self.parse_constant_expression()?;
-            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-            Ok(Node::new(
-                alignas_keyword,
-                AlignmentSpecifier::AsExpression {
-                    alignas_keyword,
-                    open_parenthesis,
-                    expression,
-                    close_parenthesis,
-                },
-            ))
-        }
+        let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
+
+        Ok(AlignmentSpecifier {
+            at,
+            alignas_keyword,
+            open_parenthesis,
+            kind,
+            close_parenthesis,
+        })
     }
-
-    fn parse_declarator(&mut self, is_typedef: bool) -> Res<'a, Node<Declarator<'a>>> {
-        let at = self.cur().at;
+    fn parse_declarator(&mut self, is_typedef: bool) -> Res<Declarator<'a>> {
+        let at = self.at();
         let pointer = self.maybe(Self::parse_pointer);
         let direct = self.parse_direct_declarator(is_typedef)?;
-
-        Ok(Node::new(at, Declarator(pointer, direct)))
+        Ok(Declarator {
+            at,
+            pointer,
+            direct,
+        })
     }
-    fn parse_direct_declarator(&mut self, is_typedef: bool) -> Res<'a, Node<DirectDeclarator<'a>>> {
+    fn parse_direct_declarator(&mut self, is_typedef: bool) -> Res<DirectDeclarator<'a>> {
         let mut left = self.parse_direct_declarator_leaf(is_typedef)?;
-
         loop {
-            match self.cur().kind {
+            match self.kind() {
                 TokenKind::OpenBracket => left = self.parse_array_declarator(left)?,
                 TokenKind::OpenParenthesis => left = self.parse_function_declarator(left)?,
                 _ => break,
@@ -1275,243 +999,248 @@ impl<'a, 'b> Parser<'a, 'b> {
 
         Ok(left)
     }
-    fn parse_direct_declarator_leaf(
-        &mut self,
-        is_typedef: bool,
-    ) -> Res<'a, Node<DirectDeclarator<'a>>> {
+    fn parse_direct_declarator_leaf(&mut self, is_typedef: bool) -> Res<DirectDeclarator<'a>> {
+        let at = self.at();
         if self.is(TokenKind::OpenParenthesis) {
-            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-            let inner = self.parse_declarator(is_typedef)?;
+            let open_parenthesis = self.next();
+            let inner = Box::new(self.parse_declarator(is_typedef)?);
             let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-
-            Ok(Node::new(
-                open_parenthesis,
-                DirectDeclarator::Parenthesized {
+            Ok(DirectDeclarator {
+                at,
+                kind: DirectDeclaratorKind::Parenthesized {
                     open_parenthesis,
                     inner,
                     close_parenthesis,
                 },
-            ))
+            })
         } else {
-            let at = self.cur().at;
             let name = self.take_identifier()?;
             let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
 
             if is_typedef {
-                self.scopes.last_mut().unwrap().typedefs.insert(name);
+                self.scopes.last_mut().unwrap().insert(name);
             }
 
-            Ok(Node::new(at, DirectDeclarator::Name(name, attributes)))
+            Ok(DirectDeclarator {
+                at,
+                kind: DirectDeclaratorKind::Name(name, attributes),
+            })
         }
     }
-    fn parse_array_declarator(
-        &mut self,
-        left: Node<DirectDeclarator<'a>>,
-    ) -> Res<'a, Node<DirectDeclarator<'a>>> {
-        let at = left.at();
+    fn parse_array_declarator(&mut self, left: DirectDeclarator<'a>) -> Res<DirectDeclarator<'a>> {
+        let at = self.at();
+        let left = Box::new(left);
         let open_bracket = self.take(TokenKind::OpenBracket)?;
-        let decl = if self.is(TokenKind::Static) {
-            let static_keyword = self.take(TokenKind::Static)?;
+        let array = if self.is(TokenKind::Static) {
+            let static_keyword = Some(self.next());
             let qualifiers = self.maybe(Self::parse_type_qualifier_list);
-            let length = self.parse_assignment_expression()?;
+            let size = Some(self.parse_assignment_expression()?);
             let close_bracket = self.take(TokenKind::CloseBracket)?;
-            ArrayDeclarator::StaticFirst {
-                open_bracket,
+            ArrayDeclarator {
+                at,
                 left,
-                static_keyword,
+                open_bracket,
                 qualifiers,
-                length,
+                kind: ArrayDeclaratorKind::Normal {
+                    static_keyword,
+                    size,
+                },
                 close_bracket,
             }
         } else {
             let qualifiers = self.maybe(Self::parse_type_qualifier_list);
             if qualifiers.is_some() && self.is(TokenKind::Static) {
-                let qualifiers = qualifiers.unwrap();
-                let static_keyword = self.take(TokenKind::Static)?;
-                let length = self.parse_assignment_expression()?;
+                let static_keyword = Some(self.next());
+                let size = Some(self.parse_assignment_expression()?);
                 let close_bracket = self.take(TokenKind::CloseBracket)?;
-
-                ArrayDeclarator::StaticMid {
+                ArrayDeclarator {
+                    at,
                     left,
                     open_bracket,
                     qualifiers,
-                    static_keyword,
-                    length,
+                    kind: ArrayDeclaratorKind::Normal {
+                        static_keyword,
+                        size,
+                    },
                     close_bracket,
                 }
             } else if self.is(TokenKind::Asterisk) {
-                let asterisk = self.take(TokenKind::Asterisk)?;
+                let asterisk = self.next();
                 let close_bracket = self.take(TokenKind::CloseBracket)?;
-                ArrayDeclarator::Variable {
+                ArrayDeclarator {
+                    at,
                     left,
                     open_bracket,
                     qualifiers,
-                    asterisk,
+                    kind: ArrayDeclaratorKind::Var { asterisk },
                     close_bracket,
                 }
             } else {
-                let length = self.maybe(Self::parse_assignment_expression);
+                let size = self.maybe(Self::parse_assignment_expression);
                 let close_bracket = self.take(TokenKind::CloseBracket)?;
-                ArrayDeclarator::NoStatic {
+                ArrayDeclarator {
+                    at,
                     left,
                     open_bracket,
                     qualifiers,
-                    length,
+                    kind: ArrayDeclaratorKind::Normal {
+                        static_keyword: None,
+                        size,
+                    },
                     close_bracket,
                 }
             }
         };
-        let array = Node::new(at, decl);
-        let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
 
-        Ok(Node::new(
-            array.at(),
-            DirectDeclarator::Array(array, attributes),
-        ))
+        let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
+        Ok(DirectDeclarator {
+            at,
+            kind: DirectDeclaratorKind::Array(array, attributes),
+        })
     }
     fn parse_function_declarator(
         &mut self,
-        left: Node<DirectDeclarator<'a>>,
-    ) -> Res<'a, Node<DirectDeclarator<'a>>> {
+        left: DirectDeclarator<'a>,
+    ) -> Res<DirectDeclarator<'a>> {
+        let at = self.at();
+        let left = Box::new(left);
         let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
         let parameters = self.maybe(Self::parse_parameter_type_list);
         let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-        let function = Node::new(
-            left.at(),
-            FunctionDeclarator {
-                left,
-                open_parenthesis,
-                parameters,
-                close_parenthesis,
-            },
-        );
         let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
-        Ok(Node::new(
-            function.at(),
-            DirectDeclarator::Function(function, attributes),
-        ))
+
+        Ok(DirectDeclarator {
+            at,
+            kind: DirectDeclaratorKind::Function(
+                FunctionDeclarator {
+                    at,
+                    left,
+                    open_parenthesis,
+                    parameters,
+                    close_parenthesis,
+                },
+                attributes,
+            ),
+        })
     }
-    fn parse_pointer(&mut self) -> Res<'a, Node<Pointer<'a>>> {
+    fn parse_pointer(&mut self) -> Res<Pointer<'a>> {
+        let at = self.at();
         let asterisk = self.take(TokenKind::Asterisk)?;
         let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
         let qualifiers = self.maybe(Self::parse_type_qualifier_list);
+        let right = self.maybe(Self::parse_pointer).map(Box::new);
 
-        if let Ok(outer) = self.try_to(Self::parse_pointer) {
-            Ok(Node::new(
-                asterisk,
-                Pointer::Rec {
-                    asterisk,
-                    attributes,
-                    qualifiers,
-                    outer,
-                },
-            ))
+        Ok(Pointer {
+            at,
+            asterisk,
+            attributes,
+            qualifiers,
+            right,
+        })
+    }
+    fn parse_type_qualifier_list(&mut self) -> Res<TypeQualifierList> {
+        self.list(Self::parse_type_qualifier)
+    }
+    fn parse_parameter_type_list(&mut self) -> Res<ParameterTypeList<'a>> {
+        let at = self.at();
+        let parameters = self.maybe(Self::parse_parameter_list);
+        let final_comma = if parameters.is_some() && self.is(TokenKind::Comma) {
+            Some(self.next())
         } else {
-            Ok(Node::new(
-                asterisk,
-                Pointer::Leaf {
-                    asterisk,
-                    attributes,
-                    qualifiers,
-                },
-            ))
-        }
-    }
-    fn parse_type_qualifier_list(&mut self) -> Res<'a, Node<TypeQualifierList>> {
-        self.parse_list(
-            Self::parse_type_qualifier,
-            TypeQualifierList::Leaf,
-            TypeQualifierList::Rec,
-        )
-    }
-    fn parse_parameter_type_list(&mut self) -> Res<'a, Node<ParameterTypeList<'a>>> {
-        if self.is(TokenKind::Ellipses) {
-            let ellipses = self.take(TokenKind::Ellipses)?;
-            Ok(Node::new(ellipses, ParameterTypeList::Var { ellipses }))
-        } else {
-            let parameters = self.parse_parameter_list()?;
-            if self.is(TokenKind::Comma) {
-                let comma = self.take(TokenKind::Comma)?;
-                let ellipses = self.take(TokenKind::Ellipses)?;
-                Ok(Node::new(
-                    parameters.at(),
-                    ParameterTypeList::WithVar {
-                        parameters,
-                        comma,
-                        ellipses,
-                    },
-                ))
-            } else {
-                Ok(Node::new(
-                    parameters.at(),
-                    ParameterTypeList::NoVar(parameters),
-                ))
-            }
-        }
-    }
-    fn parse_parameter_list(&mut self) -> Res<'a, Node<ParameterList<'a>>> {
-        self.parse_comma_list(
-            Self::parse_parameter_declaration,
-            ParameterList::Leaf,
-            |left, comma, right| ParameterList::Rec { left, comma, right },
-        )
-    }
-    fn parse_parameter_declaration(&mut self) -> Res<'a, Node<ParameterDeclaration<'a>>> {
-        let at = self.cur().at;
-        let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
-        let specifiers = self.parse_declaration_specifiers(&mut false)?;
-
-        if let Ok(declarator) = self.try_to(|p| Self::parse_declarator(p, false)) {
-            Ok(Node::new(
-                at,
-                ParameterDeclaration::Concrete(attributes, specifiers, declarator),
-            ))
-        } else {
-            let declarator = self.maybe(Self::parse_abstract_declarator);
-            Ok(Node::new(
-                at,
-                ParameterDeclaration::Abstract(attributes, specifiers, declarator),
-            ))
-        }
-    }
-
-    fn parse_type_name(&mut self) -> Res<'a, Node<TypeName<'a>>> {
-        let specifiers = self.parse_specifier_qualifier_list()?;
-        let declarator = self.maybe(Self::parse_abstract_declarator);
-
-        Ok(Node::new(specifiers.at(), TypeName(specifiers, declarator)))
-    }
-
-    fn parse_abstract_declarator(&mut self) -> Res<'a, Node<AbstractDeclarator<'a>>> {
-        if let Ok(pointer) = self.try_to(Self::parse_pointer) {
-            if let Ok(direct) = self.try_to(Self::parse_direct_abstract_declarator) {
-                Ok(Node::new(
-                    pointer.at(),
-                    AbstractDeclarator::Direct(Some(pointer), direct),
-                ))
-            } else {
-                Ok(Node::new(
-                    pointer.at(),
-                    AbstractDeclarator::Pointer(pointer),
-                ))
-            }
-        } else {
-            let direct = self.parse_direct_abstract_declarator()?;
-            Ok(Node::new(
-                direct.at(),
-                AbstractDeclarator::Direct(None, direct),
-            ))
-        }
-    }
-    fn parse_direct_abstract_declarator(&mut self) -> Res<'a, Node<DirectAbstractDeclarator<'a>>> {
-        let mut left = if let Ok(left) = self.try_to(Self::parse_direct_abstract_declarator_leaf) {
-            Some(left)
+            None
+        };
+        let ellipses = if parameters.is_none() || final_comma.is_some() {
+            self.maybe(|p| p.take(TokenKind::Ellipses))
         } else {
             None
         };
 
+        let parameters = parameters.map(|p| (p, final_comma));
+
+        Ok(ParameterTypeList {
+            at,
+            parameters,
+            ellipses,
+        })
+    }
+    fn parse_parameter_list(&mut self) -> Res<ParameterList<'a>> {
+        self.comma_list(Self::parse_parameter_declaration)
+    }
+    fn parse_parameter_declaration(&mut self) -> Res<ParameterDeclaration<'a>> {
+        let at = self.at();
+        let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
+        let specifiers = self.parse_declaration_specifiers(&mut false)?;
+        let kind = self.one_of(
+            [
+                &mut |p| {
+                    Ok(ParameterDeclarationKind::Concrete(
+                        p.parse_declarator(false)?,
+                    ))
+                },
+                &mut |p| {
+                    Ok(ParameterDeclarationKind::Abstract(
+                        p.maybe(Self::parse_abstract_declarator),
+                    ))
+                },
+            ],
+            Expected::ParameterDeclarationDeclarator,
+        )?;
+
+        Ok(ParameterDeclaration {
+            at,
+            attributes,
+            specifiers,
+            kind,
+        })
+    }
+    fn parse_type_name(&mut self) -> Res<TypeName<'a>> {
+        let at = self.at();
+        let specifier_qualifiers = self.parse_specifier_qualifier_list()?;
+        let declarator = self.maybe(Self::parse_abstract_declarator);
+
+        Ok(TypeName {
+            at,
+            specifier_qualifiers,
+            declarator,
+        })
+    }
+    fn parse_abstract_declarator(&mut self) -> Res<AbstractDeclarator<'a>> {
+        let at = self.at();
+        let pointer = self.maybe(Self::parse_pointer);
+        if pointer.is_none() {
+            let direct = self.parse_direct_abstract_declarator()?;
+            Ok(AbstractDeclarator {
+                at,
+                pointer,
+                direct: Some(direct),
+            })
+        } else {
+            let direct = self.maybe(Self::parse_direct_abstract_declarator);
+            Ok(AbstractDeclarator {
+                at,
+                pointer,
+                direct,
+            })
+        }
+    }
+    fn parse_direct_abstract_declarator(&mut self) -> Res<DirectAbstractDeclarator<'a>> {
+        let mut left = self.maybe(|p| {
+            let at = p.at();
+            let open_parenthesis = p.take(TokenKind::OpenParenthesis)?;
+            let inner = Box::new(p.parse_abstract_declarator()?);
+            let close_parenthesis = p.take(TokenKind::CloseParenthesis)?;
+            Ok(DirectAbstractDeclarator {
+                at,
+                kind: DirectAbstractDeclaratorKind::Parenthesized {
+                    open_parenthesis,
+                    inner,
+                    close_parenthesis,
+                },
+            })
+        });
+
         loop {
-            match self.cur().kind {
+            match self.kind() {
                 TokenKind::OpenBracket => left = Some(self.parse_array_abstract_declarator(left)?),
                 TokenKind::OpenParenthesis => {
                     left = Some(self.parse_function_abstract_declarator(left)?)
@@ -1521,830 +1250,764 @@ impl<'a, 'b> Parser<'a, 'b> {
         }
 
         let Some(left) = left else {
-            self.err_expected(Expected::AbstractDeclarator)?;
-            unreachable!()
+            self.err(Expected::DirectAbstractDeclarator);
+            return Err(());
         };
 
         Ok(left)
     }
-    fn parse_direct_abstract_declarator_leaf(
-        &mut self,
-    ) -> Res<'a, Node<DirectAbstractDeclarator<'a>>> {
-        let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-        let inner = self.parse_abstract_declarator()?;
-        let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-
-        Ok(Node::new(
-            open_parenthesis,
-            DirectAbstractDeclarator::Parenthesized {
-                open_parenthesis,
-                inner,
-                close_parenthesis,
-            },
-        ))
-    }
     fn parse_array_abstract_declarator(
         &mut self,
-        left: Option<Node<DirectAbstractDeclarator<'a>>>,
-    ) -> Res<'a, Node<DirectAbstractDeclarator<'a>>> {
-        let at = left.as_ref().map(|l| l.at()).unwrap_or(self.cur().at);
+        left: Option<DirectAbstractDeclarator<'a>>,
+    ) -> Res<DirectAbstractDeclarator<'a>> {
+        let left = left.map(Box::new);
+        let at = self.at();
         let open_bracket = self.take(TokenKind::OpenBracket)?;
-        let decl = if self.is(TokenKind::Static) {
-            let static_keyword = self.take(TokenKind::Static)?;
+        let kind = if self.is(TokenKind::Static) {
+            let static_keyword = Some(self.next());
             let qualifiers = self.maybe(Self::parse_type_qualifier_list);
-            let length = self.parse_assignment_expression()?;
-            let close_bracket = self.take(TokenKind::CloseBracket)?;
-            ArrayAbstractDeclarator::StaticFirst {
-                open_bracket,
-                left,
-                static_keyword,
+            let size = Some(Box::new(self.parse_assignment_expression()?));
+            ArrayAbstractDeclaratorKind::Normal {
                 qualifiers,
-                length,
-                close_bracket,
+                static_keyword,
+                size,
             }
         } else if self.is(TokenKind::Asterisk) {
-            let asterisk = self.take(TokenKind::Asterisk)?;
-            let close_bracket = self.take(TokenKind::CloseBracket)?;
-            ArrayAbstractDeclarator::Variable {
-                left,
-                open_bracket,
-                asterisk,
-                close_bracket,
+            ArrayAbstractDeclaratorKind::Var {
+                asterisk: self.next(),
             }
         } else {
             let qualifiers = self.maybe(Self::parse_type_qualifier_list);
             if qualifiers.is_some() && self.is(TokenKind::Static) {
-                let qualifiers = qualifiers.unwrap();
-                let static_keyword = self.take(TokenKind::Static)?;
-                let length = self.parse_assignment_expression()?;
-                let close_bracket = self.take(TokenKind::CloseBracket)?;
-
-                ArrayAbstractDeclarator::StaticMid {
-                    left,
-                    open_bracket,
+                let static_keyword = Some(self.take(TokenKind::Static)?);
+                let size = Some(Box::new(self.parse_assignment_expression()?));
+                ArrayAbstractDeclaratorKind::Normal {
                     qualifiers,
                     static_keyword,
-                    length,
-                    close_bracket,
+                    size,
                 }
             } else {
-                let length = self.maybe(Self::parse_assignment_expression);
-                let close_bracket = self.take(TokenKind::CloseBracket)?;
-                ArrayAbstractDeclarator::NoStatic {
-                    left,
-                    open_bracket,
+                let size = self.maybe(Self::parse_assignment_expression).map(Box::new);
+                ArrayAbstractDeclaratorKind::Normal {
                     qualifiers,
-                    length,
-                    close_bracket,
+                    static_keyword: None,
+                    size,
                 }
             }
         };
-        let array = Node::new(at, decl);
+
+        let close_bracket = self.take(TokenKind::CloseBracket)?;
+
+        let array = ArrayAbstractDeclarator {
+            at,
+            left,
+            open_bracket,
+            kind,
+            close_bracket,
+        };
+
         let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
 
-        Ok(Node::new(
-            array.at(),
-            DirectAbstractDeclarator::Array(array, attributes),
-        ))
+        Ok(DirectAbstractDeclarator {
+            at,
+            kind: DirectAbstractDeclaratorKind::Array(array, attributes),
+        })
     }
     fn parse_function_abstract_declarator(
         &mut self,
-        left: Option<Node<DirectAbstractDeclarator<'a>>>,
-    ) -> Res<'a, Node<DirectAbstractDeclarator<'a>>> {
-        let at = left.as_ref().map(|l| l.at()).unwrap_or(self.cur().at);
+        left: Option<DirectAbstractDeclarator<'a>>,
+    ) -> Res<DirectAbstractDeclarator<'a>> {
+        let left = left.map(Box::new);
+        let at = self.at();
         let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
         let parameters = self.maybe(Self::parse_parameter_type_list);
         let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-        let function = Node::new(
+
+        let function = FunctionAbstractDeclarator {
             at,
-            FunctionAbstractDeclarator {
-                left,
-                open_parenthesis,
-                parameters,
-                close_parenthesis,
-            },
-        );
-        let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
-        Ok(Node::new(
-            function.at(),
-            DirectAbstractDeclarator::Function(function, attributes),
-        ))
-    }
-
-    fn parse_typedef_name(&mut self) -> Res<'a, &'a str> {
-        let TokenKind::Identifier(name) = self.cur().kind else {
-            self.err_expected(Expected::TypedefName)?;
-            unreachable!()
+            left,
+            open_parenthesis,
+            parameters,
+            close_parenthesis,
         };
-        if !self.scopes.last().unwrap().typedefs.contains(name) {
-            self.err_expected(Expected::TypedefName)?;
-            unreachable!()
-        }
+        let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
 
-        self.next();
-        Ok(name)
+        Ok(DirectAbstractDeclarator {
+            at,
+            kind: DirectAbstractDeclaratorKind::Function(function, attributes),
+        })
     }
-
-    fn parse_braced_initializer(&mut self) -> Res<'a, Node<BracedInitializer<'a>>> {
+    fn parse_braced_initializer(&mut self) -> Res<BracedInitializer<'a>> {
+        let at = self.at();
         let open_brace = self.take(TokenKind::OpenBrace)?;
-        if self.is(TokenKind::CloseBrace) {
-            let close_brace = self.take(TokenKind::CloseBrace)?;
-            Ok(Node::new(
-                open_brace,
-                BracedInitializer::Empty {
-                    open_brace,
-                    close_brace,
-                },
-            ))
+        let initializers = if self.is(TokenKind::CloseBrace) {
+            None
         } else {
-            let initializers = self.parse_initializer_list()?;
+            let initializer = self.parse_initializer_list()?;
             let final_comma = self.maybe(|p| p.take(TokenKind::Comma));
-            let close_brace = self.take(TokenKind::CloseBrace)?;
-            Ok(Node::new(
-                open_brace,
-                BracedInitializer::List {
-                    open_brace,
-                    initializers,
-                    final_comma,
-                    close_brace,
-                },
-            ))
-        }
-    }
-    fn parse_initializer(&mut self) -> Res<'a, Node<Initializer<'a>>> {
-        if let Ok(expr) = self.try_to(Self::parse_assignment_expression) {
-            Ok(Node::new(expr.at(), Initializer::Expression(expr)))
-        } else {
-            let braced = self.parse_braced_initializer()?;
-            Ok(Node::new(braced.at(), Initializer::Braced(braced)))
-        }
-    }
-    fn parse_initializer_list(&mut self) -> Res<'a, Node<InitializerList<'a>>> {
-        let at = self.cur().at;
-        let designation = self.maybe(Self::parse_designation);
-        let initializer = self.parse_initializer()?;
-        let mut left = Node::new(at, InitializerList::Leaf(designation, initializer));
+            Some((initializer, final_comma))
+        };
+        let close_brace = self.take(TokenKind::CloseBrace)?;
 
-        while self.is(TokenKind::Comma) {
-            let comma = self.take(TokenKind::Comma)?;
-            let designation = self.maybe(Self::parse_designation);
-            let initializer = self.parse_initializer()?;
-            left = Node::new(
-                left.at(),
-                InitializerList::Rec {
-                    left,
-                    comma,
-                    designation,
-                    initializer,
-                },
-            )
-        }
-
-        Ok(left)
+        Ok(BracedInitializer {
+            at,
+            open_brace,
+            initializers,
+            close_brace,
+        })
     }
-    fn parse_designation(&mut self) -> Res<'a, Node<Designation<'a>>> {
+    fn parse_initializer(&mut self) -> Res<Initializer<'a>> {
+        let at = self.at();
+        let kind = self.one_of(
+            [
+                &mut |p| {
+                    Ok(InitializerKind::Expression(
+                        p.parse_assignment_expression()?,
+                    ))
+                },
+                &mut |p| {
+                    Ok(InitializerKind::Braced(Box::new(
+                        p.parse_braced_initializer()?,
+                    )))
+                },
+            ],
+            Expected::Initializer,
+        )?;
+
+        Ok(Initializer { at, kind })
+    }
+    fn parse_initializer_list(&mut self) -> Res<InitializerList<'a>> {
+        self.comma_list(|p| {
+            let designation = p.maybe(Self::parse_designation);
+            let initializer = p.parse_initializer()?;
+            Ok((designation, initializer))
+        })
+    }
+    fn parse_designation(&mut self) -> Res<Designation<'a>> {
+        let at = self.at();
         let designators = self.parse_designator_list()?;
         let equal = self.take(TokenKind::Equal)?;
 
-        Ok(Node::new(
-            designators.at(),
-            Designation { designators, equal },
-        ))
+        Ok(Designation {
+            at,
+            designators,
+            equal,
+        })
     }
-    fn parse_designator_list(&mut self) -> Res<'a, Node<DesignatorList<'a>>> {
-        self.parse_list(
-            Self::parse_designator,
-            DesignatorList::Leaf,
-            DesignatorList::Rec,
-        )
+    fn parse_designator_list(&mut self) -> Res<DesignatorList<'a>> {
+        self.list(Self::parse_designator)
     }
-    fn parse_designator(&mut self) -> Res<'a, Node<Designator<'a>>> {
-        if self.is(TokenKind::OpenBracket) {
-            let open_bracket = self.take(TokenKind::OpenBracket)?;
+    fn parse_designator(&mut self) -> Res<Designator<'a>> {
+        let at = self.at();
+        let kind = if self.is(TokenKind::OpenBracket) {
+            let open_bracket = self.next();
             let value = self.parse_constant_expression()?;
             let close_bracket = self.take(TokenKind::CloseBracket)?;
-
-            Ok(Node::new(
+            DesignatorKind::InBrackets {
                 open_bracket,
-                Designator::InBrackets {
-                    open_bracket,
-                    value,
-                    close_bracket,
-                },
-            ))
+                value,
+                close_bracket,
+            }
         } else {
             let period = self.take(TokenKind::Period)?;
             let name = self.take_identifier()?;
-            Ok(Node::new(period, Designator::AfterPeriod { period, name }))
-        }
-    }
+            DesignatorKind::AfterPeriod { period, name }
+        };
 
-    fn parse_static_assert_declaration(&mut self) -> Res<'a, Node<StaticAssertDeclaration<'a>>> {
+        Ok(Designator { at, kind })
+    }
+    fn parse_static_assert_declaration(&mut self) -> Res<StaticAssertDeclaration<'a>> {
+        let at = self.at();
         let static_assert_keyword = self.take(TokenKind::StaticAssert)?;
         let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
         let condition = self.parse_constant_expression()?;
-
         let message = if self.is(TokenKind::Comma) {
-            let comma = self.take(TokenKind::Comma)?;
-            let at = self.cur().at;
-            let TokenKind::String(message, encoding) = self.cur().kind else {
-                self.err_expected(Expected::StringLiteral)?;
-                unreachable!()
+            let comma = self.next();
+            let string_at = self.at();
+            let TokenKind::String(literal, encoding) = self.kind() else {
+                self.err(Expected::StringLiteral);
+                return Err(());
             };
-            let message = Node::new(at, StringLiteral(message, encoding));
-            Some((comma, message))
+            let string_literal = StringLiteral {
+                at: string_at,
+                literal,
+                encoding,
+            };
+            Some((comma, string_literal))
         } else {
             None
         };
         let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
         let semicolon = self.take(TokenKind::Semicolon)?;
 
-        Ok(Node::new(
+        Ok(StaticAssertDeclaration {
+            at,
             static_assert_keyword,
-            StaticAssertDeclaration {
-                static_assert_keyword,
-                open_parenthesis,
-                condition,
-                message,
-                close_parenthesis,
-                semicolon,
-            },
-        ))
+            open_parenthesis,
+            condition,
+            message,
+            close_parenthesis,
+            semicolon,
+        })
     }
-
-    fn parse_attribute_specifier_sequence(
-        &mut self,
-    ) -> Res<'a, Node<AttributeSpecifierSequence<'a>>> {
+    fn parse_attribute_specifier_sequence(&mut self) -> Res<AttributeSpecifierSequence<'a>> {
         let left = self.parse_attribute_specifier()?;
-        let mut left = Node::new(left.at(), AttributeSpecifierSequence(None, left));
+        let mut left = AttributeSpecifierSequence {
+            at: left.at,
+            left: None,
+            specifier: left,
+        };
 
-        while let Ok(right) = self.try_to(Self::parse_attribute_specifier) {
-            left = Node::new(left.at(), AttributeSpecifierSequence(Some(left), right));
+        while let Ok(specifier) = self.try_to(Self::parse_attribute_specifier) {
+            left = AttributeSpecifierSequence {
+                at: left.at,
+                left: Some(Box::new(left)),
+                specifier,
+            };
         }
 
         Ok(left)
     }
-    fn parse_attribute_specifier(&mut self) -> Res<'a, Node<AttributeSpecifier<'a>>> {
-        let open_bracket_0 = self.take(TokenKind::OpenBracket)?;
-        let open_bracket_1 = self.take(TokenKind::OpenBracket)?;
-        let attributes = self.parse_attribute_list()?;
-        let close_bracket_0 = self.take(TokenKind::CloseBracket)?;
-        let close_bracket_1 = self.take(TokenKind::CloseBracket)?;
-
-        Ok(Node::new(
-            open_bracket_0,
-            AttributeSpecifier {
-                open_bracket_0,
-                open_bracket_1,
-                attributes,
-                close_bracket_0,
-                close_bracket_1,
-            },
-        ))
-    }
-    fn parse_attribute_list(&mut self) -> Res<'a, Node<AttributeList<'a>>> {
-        todo!()
+    fn parse_attribute_specifier(&mut self) -> Res<AttributeSpecifier<'a>> {
+        let _at = self.at();
+        let _open_bracket_0 = self.take(TokenKind::OpenBracket)?;
+        let _open_bracket_1 = self.take(TokenKind::OpenBracket)?;
+        todo!();
     }
 
-    fn parse_statement(&mut self) -> Res<'a, Node<Statement<'a>>> {
-        if let Ok(labeled) = self.try_to(Self::parse_labeled_statement) {
-            Ok(Node::new(labeled.at(), Statement::Labeled(labeled)))
-        } else {
-            let unlabeled = self.parse_unlabeled_statement()?;
-            Ok(Node::new(unlabeled.at(), Statement::Unlabeled(unlabeled)))
-        }
+    fn parse_statement(&mut self) -> Res<Statement<'a>> {
+        let at = self.at();
+        let kind = self.one_of(
+            [
+                &mut |p| Ok(StatementKind::Labeled(p.parse_labeled_statement()?)),
+                &mut |p| Ok(StatementKind::Unlabeled(p.parse_unlabeled_statement()?)),
+            ],
+            Expected::Statement,
+        )?;
+
+        Ok(Statement { at, kind })
     }
-    fn parse_unlabeled_statement(&mut self) -> Res<'a, Node<UnlabeledStatement<'a>>> {
+    fn parse_unlabeled_statement(&mut self) -> Res<UnlabeledStatement<'a>> {
+        let at = self.at();
         if let Ok(expr_statement) = self.try_to(Self::parse_expression_statement) {
-            Ok(Node::new(
-                expr_statement.at(),
-                UnlabeledStatement::Expression(expr_statement),
-            ))
+            Ok(UnlabeledStatement {
+                at,
+                kind: UnlabeledStatementKind::Expression(expr_statement),
+            })
         } else {
-            let at = self.cur().at;
             let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
-            if let Ok(primary) = self.try_to(Self::parse_primary_block) {
-                Ok(Node::new(
-                    at,
-                    UnlabeledStatement::Primary(attributes, primary),
-                ))
+            let kind = if let Ok(primary) = self.try_to(Self::parse_primary_block) {
+                UnlabeledStatementKind::Primary(attributes, primary)
+            } else if let Ok(jump) = self.try_to(Self::parse_jump_statement) {
+                UnlabeledStatementKind::Jump(attributes, jump)
             } else {
-                let jump = self.parse_jump_statement()?;
-                Ok(Node::new(at, UnlabeledStatement::Jump(attributes, jump)))
-            }
+                self.err(Expected::UnlabeledStatement);
+                return Err(());
+            };
+            Ok(UnlabeledStatement { at, kind })
         }
     }
-    fn parse_primary_block(&mut self) -> Res<'a, Node<PrimaryBlock<'a>>> {
-        if let Ok(compound) = self.try_to(Self::parse_compound_statement) {
-            Ok(Node::new(compound.at(), PrimaryBlock::Compound(compound)))
-        } else if let Ok(selection) = self.try_to(Self::parse_selection_statement) {
-            Ok(Node::new(
-                selection.at(),
-                PrimaryBlock::Selection(selection),
-            ))
-        } else {
-            let iteration = self.parse_iteration_statement()?;
-            Ok(Node::new(
-                iteration.at(),
-                PrimaryBlock::Iteration(iteration),
-            ))
-        }
-    }
-    fn parse_secondary_block(&mut self) -> Res<'a, Node<SecondaryBlock<'a>>> {
-        let inner = self.parse_statement()?;
-        Ok(Node::new(inner.at(), SecondaryBlock(inner)))
-    }
-    fn parse_label(&mut self) -> Res<'a, Node<Label<'a>>> {
-        let at = self.cur().at;
-        let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
+    fn parse_primary_block(&mut self) -> Res<PrimaryBlock<'a>> {
+        let at = self.at();
+        let kind = self.one_of(
+            [
+                &mut |p| Ok(PrimaryBlockKind::Compound(p.parse_compound_statement()?)),
+                &mut |p| Ok(PrimaryBlockKind::Selection(p.parse_selection_statement()?)),
+                &mut |p| Ok(PrimaryBlockKind::Iteration(p.parse_iteration_statement()?)),
+            ],
+            Expected::PrimaryBlock,
+        )?;
 
-        if self.is(TokenKind::Default) {
-            let default_keyword = self.take(TokenKind::Default)?;
-            let colon = self.take(TokenKind::Colon)?;
-            Ok(Node::new(
-                at,
-                Label::Default {
-                    attributes,
-                    default_keyword,
-                    colon,
-                },
-            ))
+        Ok(PrimaryBlock { at, kind })
+    }
+    fn parse_secondary_block(&mut self) -> Res<SecondaryBlock<'a>> {
+        let at = self.at();
+        let statement = self.parse_statement()?;
+        Ok(SecondaryBlock {
+            at,
+            statement: Box::new(statement),
+        })
+    }
+    fn parse_label(&mut self) -> Res<Label<'a>> {
+        let at = self.at();
+        let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
+        let kind = if self.is(TokenKind::Default) {
+            let default_keyword = self.next();
+            LabelKind::Default { default_keyword }
         } else if self.is(TokenKind::Case) {
-            let case_keyword = self.take(TokenKind::Case)?;
+            let case_keyword = self.next();
             let value = self.parse_constant_expression()?;
-            let colon = self.take(TokenKind::Colon)?;
-            Ok(Node::new(
-                at,
-                Label::Case {
-                    attributes,
-                    case_keyword,
-                    value,
-                    colon,
-                },
-            ))
+            LabelKind::Case {
+                case_keyword,
+                value,
+            }
         } else {
             let name = self.take_identifier()?;
-            let colon = self.take(TokenKind::Colon)?;
-            Ok(Node::new(
-                at,
-                Label::Named {
-                    attributes,
-                    name,
-                    colon,
-                },
-            ))
-        }
+            LabelKind::Name(name)
+        };
+        let colon = self.take(TokenKind::Colon)?;
+
+        Ok(Label {
+            at,
+            attributes,
+            kind,
+            colon,
+        })
     }
-    fn parse_labeled_statement(&mut self) -> Res<'a, Node<LabeledStatement<'a>>> {
+    fn parse_labeled_statement(&mut self) -> Res<LabeledStatement<'a>> {
+        let at = self.at();
         let label = self.parse_label()?;
-        let statement = self.parse_statement()?;
-        Ok(Node::new(label.at(), LabeledStatement(label, statement)))
+        let statement = Box::new(self.parse_statement()?);
+        Ok(LabeledStatement {
+            at,
+            label,
+            statement,
+        })
     }
-    fn parse_compound_statement(&mut self) -> Res<'a, Node<CompoundStatement<'a>>> {
+    fn parse_compound_statement(&mut self) -> Res<CompoundStatement<'a>> {
+        let at = self.at();
         let open_brace = self.take(TokenKind::OpenBrace)?;
-        self.enter_scope();
+
+        self.scopes.push(HashSet::new());
         let items = self.maybe(Self::parse_block_item_list);
-        self.leave_scope();
+        self.scopes.pop();
+
         let close_brace = self.take(TokenKind::CloseBrace)?;
 
-        Ok(Node::new(
+        Ok(CompoundStatement {
+            at,
             open_brace,
-            CompoundStatement {
-                open_brace,
-                items,
-                close_brace,
-            },
-        ))
+            items,
+            close_brace,
+        })
     }
-    fn parse_block_item_list(&mut self) -> Res<'a, Node<BlockItemList<'a>>> {
-        self.parse_list(
-            Self::parse_block_item,
-            BlockItemList::Leaf,
-            BlockItemList::Rec,
-        )
+    fn parse_block_item_list(&mut self) -> Res<BlockItemList<'a>> {
+        self.list(Self::parse_block_item)
     }
-    fn parse_block_item(&mut self) -> Res<'a, Node<BlockItem<'a>>> {
-        if let Ok(declaration) = self.try_to(Self::parse_declaration) {
-            Ok(Node::new(
-                declaration.at(),
-                BlockItem::Declaration(declaration),
-            ))
-        } else if let Ok(unlabeled) = self.try_to(Self::parse_unlabeled_statement) {
-            Ok(Node::new(unlabeled.at(), BlockItem::Unlabeled(unlabeled)))
-        } else {
-            let label = self.parse_label()?;
-            Ok(Node::new(label.at(), BlockItem::Label(label)))
-        }
+    fn parse_block_item(&mut self) -> Res<BlockItem<'a>> {
+        let at = self.at();
+        let kind = self.one_of(
+            [
+                &mut |p| Ok(BlockItemKind::Declaration(p.parse_declaration()?)),
+                &mut |p| Ok(BlockItemKind::Unlabeled(p.parse_unlabeled_statement()?)),
+                &mut |p| Ok(BlockItemKind::Label(p.parse_label()?)),
+            ],
+            Expected::BlockItem,
+        )?;
+
+        Ok(BlockItem { at, kind })
     }
-    fn parse_expression_statement(&mut self) -> Res<'a, Node<ExpressionStatement<'a>>> {
+    fn parse_expression_statement(&mut self) -> Res<ExpressionStatement<'a>> {
+        let at = self.at();
         if let Ok(attributes) = self.try_to(Self::parse_attribute_specifier_sequence) {
             let expression = self.parse_expression()?;
             let semicolon = self.take(TokenKind::Semicolon)?;
-            Ok(Node::new(
-                attributes.at(),
-                ExpressionStatement::WithAttributes {
-                    attributes,
-                    expression,
-                    semicolon,
-                },
-            ))
+            Ok(ExpressionStatement {
+                at,
+                attributes: Some(attributes),
+                expression: Some(expression),
+                semicolon,
+            })
         } else {
-            let at = self.cur().at;
             let expression = self.maybe(Self::parse_expression);
             let semicolon = self.take(TokenKind::Semicolon)?;
-            Ok(Node::new(
+            Ok(ExpressionStatement {
                 at,
-                ExpressionStatement::WithoutAttributes {
-                    expression,
-                    semicolon,
-                },
-            ))
+                attributes: None,
+                expression,
+                semicolon,
+            })
         }
     }
-    fn parse_selection_statement(&mut self) -> Res<'a, Node<SelectionStatement<'a>>> {
-        if self.is(TokenKind::If) {
-            let if_keyword = self.take(TokenKind::If)?;
+    fn parse_selection_statement(&mut self) -> Res<SelectionStatement<'a>> {
+        let at = self.at();
+        let kind = if self.is(TokenKind::If) {
+            let if_keyword = self.next();
             let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
             let condition = self.parse_expression()?;
             let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
             let then_body = self.parse_secondary_block()?;
 
-            if self.is(TokenKind::Else) {
-                let else_keyword = self.take(TokenKind::Else)?;
+            let else_body = if self.is(TokenKind::Else) {
+                let else_keyword = self.next();
                 let else_body = self.parse_secondary_block()?;
-                Ok(Node::new(
-                    if_keyword,
-                    SelectionStatement::IfElse {
-                        if_keyword,
-                        open_parenthesis,
-                        condition,
-                        close_parenthesis,
-                        then_body,
-                        else_keyword,
-                        else_body,
-                    },
-                ))
+                Some((else_keyword, else_body))
             } else {
-                Ok(Node::new(
-                    if_keyword,
-                    SelectionStatement::If {
-                        if_keyword,
-                        open_parenthesis,
-                        condition,
-                        close_parenthesis,
-                        then_body,
-                    },
-                ))
+                None
+            };
+            SelectionStatementKind::If {
+                if_keyword,
+                open_parenthesis,
+                condition,
+                close_parenthesis,
+                then_body,
+                else_body,
             }
         } else if self.is(TokenKind::Switch) {
-            let switch_keyword = self.take(TokenKind::Switch)?;
+            let switch_keyword = self.next();
             let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-            let selector = self.parse_expression()?;
+            let controlling_expression = self.parse_expression()?;
             let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
             let body = self.parse_secondary_block()?;
-
-            Ok(Node::new(
+            SelectionStatementKind::Switch {
                 switch_keyword,
-                SelectionStatement::Switch {
-                    switch_keyword,
-                    open_parenthesis,
-                    selector,
-                    close_parenthesis,
-                    body,
-                },
-            ))
-        } else {
-            self.err_expected(Expected::SelectionStatement)?;
-            unreachable!()
-        }
-    }
-    fn parse_iteration_statement(&mut self) -> Res<'a, Node<IterationStatement<'a>>> {
-        if self.is(TokenKind::While) {
-            let while_keyword = self.take(TokenKind::While)?;
-            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-            let condition = self.parse_expression()?;
-            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-            let body = self.parse_secondary_block()?;
-
-            Ok(Node::new(
-                while_keyword,
-                IterationStatement::While {
-                    while_keyword,
-                    open_parenthesis,
-                    condition,
-                    close_parenthesis,
-                    body,
-                },
-            ))
-        } else if self.is(TokenKind::Do) {
-            let do_keyword = self.take(TokenKind::Do)?;
-            let body = self.parse_secondary_block()?;
-            let while_keyword = self.take(TokenKind::While)?;
-            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-            let condition = self.parse_expression()?;
-            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-            let semicolon = self.take(TokenKind::Semicolon)?;
-            Ok(Node::new(
-                do_keyword,
-                IterationStatement::DoWhile {
-                    do_keyword,
-                    body,
-                    while_keyword,
-                    open_parenthesis,
-                    condition,
-                    close_parenthesis,
-                    semicolon,
-                },
-            ))
-        } else if self.is(TokenKind::For) {
-            let for_keyword = self.take(TokenKind::For)?;
-            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
-
-            if let Ok(initializer) = self.try_to(Self::parse_declaration) {
-                let condition = self.maybe(Self::parse_expression);
-                let counter = self.maybe(Self::parse_expression);
-                let semicolon_1 = self.take(TokenKind::Semicolon)?;
-                let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-                let body = self.parse_secondary_block()?;
-
-                Ok(Node::new(
-                    for_keyword,
-                    IterationStatement::ForDeclaration {
-                        for_keyword,
-                        open_parenthesis,
-                        initializer,
-                        condition,
-                        semicolon_1,
-                        counter,
-                        close_parenthesis,
-                        body,
-                    },
-                ))
-            } else {
-                let initializer = self.maybe(Self::parse_expression);
-                let semicolon_0 = self.take(TokenKind::Semicolon)?;
-                let condition = self.maybe(Self::parse_expression);
-                let counter = self.maybe(Self::parse_expression);
-                let semicolon_1 = self.take(TokenKind::Semicolon)?;
-                let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
-                let body = self.parse_secondary_block()?;
-                Ok(Node::new(
-                    for_keyword,
-                    IterationStatement::For {
-                        for_keyword,
-                        open_parenthesis,
-                        initializer,
-                        semicolon_0,
-                        condition,
-                        semicolon_1,
-                        counter,
-                        close_parenthesis,
-                        body,
-                    },
-                ))
+                open_parenthesis,
+                controlling_expression,
+                close_parenthesis,
+                body,
             }
         } else {
-            self.err_expected(Expected::IterationStatement)?;
-            unreachable!()
+            self.err(Expected::SelectionStatement);
+            return Err(());
+        };
+
+        Ok(SelectionStatement { at, kind })
+    }
+    fn parse_iteration_statement(&mut self) -> Res<IterationStatement<'a>> {
+        let at = self.at();
+        let kind = if self.is(TokenKind::While) {
+            let while_keyword = self.next();
+            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
+            let condition = self.parse_expression()?;
+            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
+            let body = self.parse_secondary_block()?;
+            IterationStatementKind::While {
+                while_keyword,
+                open_parenthesis,
+                condition,
+                close_parenthesis,
+                body,
+            }
+        } else if self.is(TokenKind::Do) {
+            let do_keyword = self.next();
+            let body = self.parse_secondary_block()?;
+            let while_keyword = self.take(TokenKind::While)?;
+            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
+            let condition = self.parse_expression()?;
+            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
+            let semicolon = self.take(TokenKind::Semicolon)?;
+            IterationStatementKind::DoWhile {
+                do_keyword,
+                body,
+                while_keyword,
+                open_parenthesis,
+                condition,
+                close_parenthesis,
+                semicolon,
+            }
+        } else if self.is(TokenKind::For) {
+            self.scopes.push(HashSet::new());
+            let for_keyword = self.next();
+            let open_parenthesis = self.take(TokenKind::OpenParenthesis)?;
+            let initializer = self.parse_for_initializer()?;
+            let condition = self.maybe(Self::parse_expression);
+            let semicolon = self.take(TokenKind::Semicolon)?;
+            let counter = self.maybe(Self::parse_expression);
+            let close_parenthesis = self.take(TokenKind::CloseParenthesis)?;
+            let body = self.parse_secondary_block()?;
+            self.scopes.pop();
+            IterationStatementKind::For {
+                for_keyword,
+                open_parenthesis,
+                initializer,
+                condition,
+                semicolon,
+                counter,
+                close_parenthesis,
+                body,
+            }
+        } else {
+            self.err(Expected::IterationStatement);
+            return Err(());
+        };
+
+        Ok(IterationStatement { at, kind })
+    }
+    fn parse_for_initializer(&mut self) -> Res<ForInitializer<'a>> {
+        if let Ok(declaration) = self.try_to(Self::parse_declaration) {
+            Ok(ForInitializer::Declaration(declaration))
+        } else {
+            let expression = self.maybe(Self::parse_expression);
+            let semicolon = self.take(TokenKind::Semicolon)?;
+            Ok(ForInitializer::Expression(expression, semicolon))
         }
     }
-    fn parse_jump_statement(&mut self) -> Res<'a, Node<JumpStatement<'a>>> {
-        if self.is(TokenKind::Goto) {
-            let goto_keyword = self.take(TokenKind::Goto)?;
+    fn parse_jump_statement(&mut self) -> Res<JumpStatement<'a>> {
+        let at = self.at();
+        let kind = if self.is(TokenKind::Goto) {
+            let goto_keyword = self.next();
             let target = self.take_identifier()?;
-            let semicolon = self.take(TokenKind::Semicolon)?;
-            Ok(Node::new(
+            JumpStatementKind::Goto {
                 goto_keyword,
-                JumpStatement::Goto {
-                    goto_keyword,
-                    target,
-                    semicolon,
-                },
-            ))
+                target,
+            }
         } else if self.is(TokenKind::Continue) {
-            let continue_keyword = self.take(TokenKind::Continue)?;
-            let semicolon = self.take(TokenKind::Semicolon)?;
-            Ok(Node::new(
-                continue_keyword,
-                JumpStatement::Continue {
-                    continue_keyword,
-                    semicolon,
-                },
-            ))
+            let continue_keyword = self.next();
+            JumpStatementKind::Continue { continue_keyword }
         } else if self.is(TokenKind::Break) {
-            let break_keyword = self.take(TokenKind::Break)?;
-            let semicolon = self.take(TokenKind::Semicolon)?;
-            Ok(Node::new(
-                break_keyword,
-                JumpStatement::Break {
-                    break_keyword,
-                    semicolon,
-                },
-            ))
+            let break_keyword = self.next();
+            JumpStatementKind::Break { break_keyword }
         } else if self.is(TokenKind::Return) {
-            let return_keyword = self.take(TokenKind::Return)?;
+            let return_keyword = self.next();
             let value = self.maybe(Self::parse_expression);
-            let semicolon = self.take(TokenKind::Semicolon)?;
-
-            Ok(Node::new(
+            JumpStatementKind::Return {
                 return_keyword,
-                JumpStatement::Return {
-                    return_keyword,
-                    value,
-                    semicolon,
-                },
-            ))
+                value,
+            }
         } else {
-            self.err_expected(Expected::JumpStatement)?;
-            unreachable!()
-        }
+            self.err(Expected::JumpStatement);
+            return Err(());
+        };
+        let semicolon = self.take(TokenKind::Semicolon)?;
+
+        Ok(JumpStatement {
+            at,
+            kind,
+            semicolon,
+        })
     }
 
-    fn parse_translation_unit(&mut self) -> Res<'a, Node<TranslationUnit<'a>>> {
-        self.enter_scope();
-        let ret = self.parse_list(
-            Self::parse_external_declaration,
-            TranslationUnit::Leaf,
-            TranslationUnit::Rec,
+    fn parse_translation_unit(&mut self) -> Res<TranslationUnit<'a>> {
+        self.scopes.push(HashSet::new());
+        let out = self.list(Self::parse_external_declaration);
+        self.scopes.pop();
+        out
+    }
+    fn parse_external_declaration(&mut self) -> Res<ExternalDeclaration<'a>> {
+        let at = self.at();
+        let kind = self.one_of(
+            [
+                &mut |p| {
+                    Ok(ExternalDeclarationKind::Function(
+                        p.parse_function_definition()?,
+                    ))
+                },
+                &mut |p| Ok(ExternalDeclarationKind::Declaration(p.parse_declaration()?)),
+            ],
+            Expected::ExternalDeclaration,
         )?;
-        self.leave_scope();
-        Ok(ret)
+        Ok(ExternalDeclaration { at, kind })
     }
-    fn parse_external_declaration(&mut self) -> Res<'a, Node<ExternalDeclaration<'a>>> {
-        if let Ok(function) = self.try_to(Self::parse_function_definition) {
-            Ok(Node::new(
-                function.at(),
-                ExternalDeclaration::FunctionDefinition(function),
-            ))
-        } else {
-            let declaration = self.parse_declaration()?;
-            Ok(Node::new(
-                declaration.at(),
-                ExternalDeclaration::Declaration(declaration),
-            ))
-        }
-    }
-    fn parse_function_definition(&mut self) -> Res<'a, Node<FunctionDefinition<'a>>> {
-        let at = self.cur().at;
+    fn parse_function_definition(&mut self) -> Res<FunctionDefinition<'a>> {
+        let at = self.at();
         let attributes = self.maybe(Self::parse_attribute_specifier_sequence);
         let specifiers = self.parse_declaration_specifiers(&mut false)?;
         let declarator = self.parse_declarator(false)?;
-        let function_body = self.parse_function_body()?;
-        Ok(Node::new(
+        let body = self.parse_compound_statement()?;
+
+        Ok(FunctionDefinition {
             at,
-            FunctionDefinition(attributes, specifiers, declarator, function_body),
-        ))
-    }
-    fn parse_function_body(&mut self) -> Res<'a, Node<FunctionBody<'a>>> {
-        let compound = self.parse_compound_statement()?;
-        Ok(Node::new(compound.at(), FunctionBody(compound)))
+            attributes,
+            specifiers,
+            declarator,
+            body,
+        })
     }
 
-    fn try_to<T>(&mut self, mut to: impl FnMut(&mut Self) -> Res<'a, T>) -> Res<'a, T> {
+    fn is_typedef_name(&self, name: &str) -> bool {
+        for scope in self.scopes.iter().rev() {
+            if scope.contains(name) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn parse_binary_expression(
+        &mut self,
+        parse: fn(&mut Self) -> Res<Expression<'a>>,
+        operations: &[(TokenKind<'a>, BinaryOperator)],
+    ) -> Res<Expression<'a>> {
+        let mut left = parse(self)?;
+        'outer: loop {
+            for &(token, operator) in operations {
+                if self.is(token) {
+                    let at = left.at;
+                    let operator_at = self.next();
+                    let right = parse(self)?;
+                    let new_left = Box::new(left);
+                    let right = Box::new(right);
+                    let kind = ExpressionKind::Binary {
+                        left: new_left,
+                        operator: (operator_at, operator),
+                        right,
+                    };
+                    left = Expression { at, kind };
+                    continue 'outer;
+                }
+            }
+            break;
+        }
+
+        Ok(left)
+    }
+
+    fn one_of<T, const N: usize>(
+        &mut self,
+        options: [&mut dyn FnMut(&mut Self) -> Res<T>; N],
+        expected: Expected<'a>,
+    ) -> Res<T> {
+        for option in options {
+            if let Ok(t) = self.try_to(|p| option(p)) {
+                return Ok(t);
+            }
+        }
+
+        self.err(expected);
+        Err(())
+    }
+    fn list<T>(&mut self, mut parse: impl FnMut(&mut Self) -> Res<T>) -> Res<List<T>> {
+        let at = self.at();
+        let left = parse(self)?;
+        let mut left = List {
+            at,
+            kind: ListKind::Leaf(Box::new(left)),
+        };
+
+        loop {
+            if let Ok(right) = self.try_to(&mut parse) {
+                left = List {
+                    at: left.at,
+                    kind: ListKind::Cons(Box::new(left), Box::new(right)),
+                };
+            } else {
+                break;
+            }
+        }
+
+        Ok(left)
+    }
+    fn comma_list<T>(&mut self, mut parse: impl FnMut(&mut Self) -> Res<T>) -> Res<CommaList<T>> {
+        let at = self.at();
+        let left = parse(self)?;
+        let mut left = CommaList {
+            at,
+            kind: CommaListKind::Leaf(Box::new(left)),
+        };
+
+        loop {
+            if !self.is(TokenKind::Comma) {
+                break;
+            };
+            let comma = self.next();
+            let right = parse(self)?;
+            left = CommaList {
+                at: left.at,
+                kind: CommaListKind::Cons {
+                    left: Box::new(left),
+                    comma,
+                    right: Box::new(right),
+                },
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn maybe<T>(&mut self, parse: impl FnMut(&mut Self) -> Res<T>) -> Option<T> {
+        if let Ok(t) = self.try_to(parse) {
+            Some(t)
+        } else {
+            None
+        }
+    }
+    fn try_to<T>(&mut self, mut parse: impl FnMut(&mut Self) -> Res<T>) -> Res<T> {
         let index = self.index;
-        let scopes = self.scopes.clone();
+        let err_length = self.errors.len();
+        let scopes_length = self.scopes.len();
+        self.scopes.push(HashSet::new());
 
-        match to(self) {
-            Ok(t) => Ok(t),
-            Err(err) => {
+        match parse(self) {
+            Ok(t) => {
+                let top = self.scopes.pop().unwrap();
+                debug_assert_eq!(scopes_length, self.scopes.len());
+                self.scopes.last_mut().unwrap().extend(top);
+                Ok(t)
+            }
+            Err(()) => {
+                self.scopes.drain(scopes_length..);
+                self.errors.drain(err_length..);
                 self.index = index;
-                self.scopes = scopes;
-                Err(err)
+                Err(())
             }
         }
     }
-    fn maybe<T>(&mut self, parse: impl FnMut(&mut Self) -> Res<'a, T>) -> Option<T> {
-        match self.try_to(parse) {
-            Ok(t) => Some(t),
-            Err(_) => None,
-        }
-    }
-    fn parse_list<L, T>(
-        &mut self,
-        mut parse: impl FnMut(&mut Self) -> Res<'a, Node<T>>,
-        leaf: impl Fn(Node<T>) -> L,
-        rec: impl Fn(Node<L>, Node<T>) -> L,
-    ) -> Res<'a, Node<L>> {
-        let left = parse(self)?;
-        let mut left = Node::new(left.at(), leaf(left));
 
-        loop {
-            let Ok(right) = self.try_to(&mut parse) else {
-                break;
-            };
-            left = Node::new(left.at(), rec(left, right));
-        }
-
-        Ok(left)
-    }
-    fn parse_comma_list<L, T>(
-        &mut self,
-        parse: impl Fn(&mut Self) -> Res<'a, Node<T>>,
-        leaf: impl Fn(Node<T>) -> L,
-        rec: impl Fn(Node<L>, At, Node<T>) -> L,
-    ) -> Res<'a, Node<L>> {
-        let left = parse(self)?;
-        let mut left = Node::new(left.at(), leaf(left));
-
-        while self.is(TokenKind::Comma) {
-            let comma = self.take(TokenKind::Comma)?;
-            let right = parse(self)?;
-
-            left = Node::new(left.at(), rec(left, comma, right));
-        }
-
-        Ok(left)
-    }
-
-    fn take(&mut self, kind: TokenKind<'a>) -> Res<'a, At> {
-        if !self.is(kind) {
-            self.err_expected(kind)?;
-            unreachable!()
-        }
-
-        let at = self.cur().at;
-        self.next();
-        Ok(at)
-    }
-    fn take_identifier(&mut self) -> Res<'a, &'a str> {
-        let TokenKind::Identifier(name) = self.cur().kind else {
-            self.err_expected(Expected::Identifier)?;
-            unreachable!()
+    fn take_identifier(&mut self) -> Res<&'a str> {
+        let TokenKind::Identifier(name) = self.kind() else {
+            self.err(Expected::Identifier);
+            return Err(());
         };
         self.next();
         Ok(name)
     }
-    fn next(&mut self) {
+    fn take(&mut self, kind: TokenKind<'a>) -> Res<At> {
+        if !self.is(kind) {
+            self.err(Expected::Token(kind));
+            return Err(());
+        }
+        Ok(self.next())
+    }
+    fn next(&mut self) -> At {
+        let at = self.at();
         self.index += 1;
+        at
     }
     fn is(&self, kind: TokenKind) -> bool {
-        if self.index >= self.tokens.len() {
-            panic!("out-of-bounds check for token {kind:?}");
-        }
-
-        let cur = self.cur().kind;
-        let is = cur == kind;
-        // let compares = if is { "equal" } else { "non-equal" };
-        // eprintln!("Token {cur:?} compares {compares} to {kind:?}");
-        is
+        self.kind() == kind
+    }
+    fn kind(&self) -> TokenKind<'a> {
+        self.cur().kind
+    }
+    fn at(&self) -> At {
+        self.cur().at
     }
     fn cur(&self) -> Token<'a> {
-        self.peek(0)
-    }
-    fn peek(&self, offset: usize) -> Token<'a> {
-        let i = self.index + offset;
-        self.tokens[i]
+        self.tokens[self.index]
     }
 
-    fn err_expected(&self, expected: impl Into<Expected<'a>>) -> Res<'a, ()> {
-        Err(ParseErr {
-            at: self.cur(),
-            kind: ParseErrKind::Expected(expected.into()),
-        })
+    fn err(&mut self, expected: Expected<'a>) {
+        let at = self.cur();
+        self.err_at(at, expected);
+    }
+    fn err_at(&mut self, at: Token<'a>, expected: Expected<'a>) {
+        self.errors.push(ParseErr { at, expected });
     }
 }
 
-#[derive(Clone, Debug)]
-struct Scope<'a> {
-    typedefs: HashSet<&'a str>,
-}
+type Res<T> = Result<T, ()>;
 
-type Res<'a, T> = Result<T, ParseErr<'a>>;
-
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ParseErr<'a> {
     pub at: Token<'a>,
-    pub kind: ParseErrKind<'a>,
+    pub expected: Expected<'a>,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub enum ParseErrKind<'a> {
-    Expected(Expected<'a>),
-}
-
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Expected<'a> {
     Token(TokenKind<'a>),
     PrimaryExpression,
-    PostfixExpressionLeaf,
     Identifier,
     AssignmentOperator,
     DeclarationSpecifier,
     StorageClassSpecifier,
     TypeSpecifier,
     StructOrUnion,
-    Typeof,
     TypeSpecifierQualifier,
+    TypeofSpecifierArgument,
     TypeQualifier,
-    AbstractDeclarator,
+    AlignasArgument,
+    ParameterDeclarationDeclarator,
+    DirectAbstractDeclarator,
+    Initializer,
     StringLiteral,
-    TypedefName,
+    Statement,
+    UnlabeledStatement,
+    PrimaryBlock,
+    BlockItem,
     SelectionStatement,
     IterationStatement,
     JumpStatement,
-}
-impl<'a> From<TokenKind<'a>> for Expected<'a> {
-    fn from(value: TokenKind<'a>) -> Self {
-        Self::Token(value)
-    }
+    ExternalDeclaration,
 }

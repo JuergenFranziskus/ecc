@@ -17,7 +17,18 @@ fn main() {
         );
     }
 
-    let ast = Parser::new(&tokens).parse().unwrap();
+    let (ast, parse_errs) = Parser::new(&tokens).parse();
+    if !parse_errs.is_empty() {
+        eprintln!("Encountered {} parsing errors:", parse_errs.len());
+    }
+    for parse_err in &parse_errs {
+        eprintln!("    {parse_err:?}");
+    }
+    let Ok(ast) = ast else {
+        eprintln!("Cannot continue compilation process");
+        return;
+    };
+
     println!("{ast:#?}");
 }
 

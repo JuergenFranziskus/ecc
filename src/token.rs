@@ -156,9 +156,9 @@ pub enum StringEncoding {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct At {
-    pub column: u32,
     pub file: usize,
     pub line: u32,
+    pub column: u32,
 }
 impl At {
     pub fn new(file: usize, line: u32, column: u32) -> Self {
